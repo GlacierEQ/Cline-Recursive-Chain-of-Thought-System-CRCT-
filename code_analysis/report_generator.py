@@ -1,359 +1,115 @@
-import json
+"""
+Enhanced CRCT report_generator (Orchestrator)
+==============================================
+
+Decomposed monolithic script into sub-modules:
+- scanner.static_engine: Regex and tree-sitter scanning.
+- scanner.runtime_bridge: RuntimeIndex and metadata enrichment.
+- reporting.markdown_formatter: Markdown report generation.
+- reporting.json_exporter: JSON report generation.
+"""
+
+from __future__ import annotations
+
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any, Dict, List, Tuple
 
-# Add project root to sys.path to allow imports from cline_utils
+# ---------------------------------------------------------------------------
+# Project-root bootstrap
+# ---------------------------------------------------------------------------
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from cline_utils.dependency_system.utils import path_utils
-from cline_utils.dependency_system.utils.config_manager import ConfigManager
+from cline_utils.dependency_system.utils import path_utils  # noqa: E402
+from cline_utils.dependency_system.utils.config_manager import (
+    ConfigManager,
+)  # noqa: E402
 
-# Tree-sitter imports
-try:
-    import tree_sitter_javascript
-    import tree_sitter_python
-    import tree_sitter_typescript
-    from tree_sitter import Language, Parser
+from code_analysis.scanner.static_engine import (
+    EXTENSIONS,
+    PYRIGHT_OUTPUT,
+    get_unused_items,
+    scan_file,
+)
+from code_analysis.scanner.runtime_bridge import (
+    RuntimeIndex,
+    enrich_issue,
+    load_runtime_data,
+    maybe_run_runtime_inspector,
+    runtime_only_findings,
+)
+from code_analysis.reporting.markdown_formatter import format_markdown
+from code_analysis.reporting.json_exporter import export_json
+from code_analysis.scanner.comment_index import scan_project_comments
 
-    TREE_SITTER_AVAILABLE = True
-except ImportError:
-    TREE_SITTER_AVAILABLE = False
-    print("Warning: tree-sitter not available. Falling back to regex-based analysis.")
-
-# Initialize ConfigManager
 config = ConfigManager()
 
+# ---------------------------------------------------------------------------
 # Configuration
-EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx", ".md", ".txt"}
-
-PATTERNS = {
-    "TODO": re.compile(r"TODO", re.IGNORECASE),
-    "FIXME": re.compile(r"FIXME", re.IGNORECASE),
-    "pass": re.compile(r"^\s*pass\s*$", re.MULTILINE),  # stricter pass check
-    "NotImplementedError": re.compile(r"NotImplementedError"),
-    "in a real": re.compile(r"in a real", re.IGNORECASE),
-    "for now": re.compile(r"for now", re.IGNORECASE),
-    "simplified": re.compile(r"simplified", re.IGNORECASE),
-    "placeholder": re.compile(r"placeholder", re.IGNORECASE),
-}
-
-OUTPUT_FILE = "code_analysis/issues_report.md"
-PYRIGHT_OUTPUT = "pyright_output.json"
-
-
-def get_parser(lang_name):
-    if not TREE_SITTER_AVAILABLE:
-        return None
-
-    try:
-        parser = Parser()
-        if lang_name == "python":
-            parser.language = Language(tree_sitter_python.language())
-        elif lang_name == "javascript":
-            parser.language = Language(tree_sitter_javascript.language())
-        elif lang_name == "typescript":
-            parser.language = Language(tree_sitter_typescript.language_typescript())
-        elif lang_name == "tsx":
-            parser.language = Language(tree_sitter_typescript.language_tsx())
-        else:
-            return None
-        return parser
-    except Exception as e:
-        print(f"Error initializing parser for {lang_name}: {e}")
-        return None
-
-
-def analyze_node(node, issues, filepath, source_code):
-    """Recursively analyze tree-sitter nodes."""
-
-    # Python checks
-    if node.type in ("function_definition", "async_function_definition"):
-        # Check for empty body or pass/docstring only
-        body_node = node.child_by_field_name("body")
-        if body_node:
-            has_raise_not_implemented = False
-
-            # Filter out trivial children (comments, pass, docstrings)
-            non_trivial_children = []
-
-            for child in body_node.children:
-                if child.type == "comment":
-                    continue
-                if child.type == "pass_statement":
-                    continue
-                if child.type == "expression_statement":
-                    # Check if it's a docstring (string literal)
-                    if child.child_count == 1 and child.children[0].type == "string":
-                        continue
-
-                if child.type == "raise_statement":
-                    # Check if raising NotImplementedError
-                    if "NotImplementedError" in child.text.decode("utf8"):
-                        has_raise_not_implemented = True
-                        # We count this as "trivial" for the purpose of finding *other* code,
-                        # but we flag it specifically later.
-                        continue
-
-                non_trivial_children.append(child)
-
-            if not non_trivial_children:
-                if has_raise_not_implemented:
-                    issues.append(
-                        {
-                            "type": "Incomplete Implementation",
-                            "subtype": "NotImplementedError",
-                            "file": str(filepath),
-                            "line": node.start_point[0] + 1,
-                            "content": node.text.decode("utf8").split("\n")[0] + "...",
-                        }
-                    )
-                else:
-                    issues.append(
-                        {
-                            "type": "Improper Implementation",
-                            "subtype": "Empty/Stub Function",
-                            "file": str(filepath),
-                            "line": node.start_point[0] + 1,
-                            "content": node.text.decode("utf8").split("\n")[0] + "...",
-                        }
-                    )
-
-    elif node.type == "class_definition":
-        body_node = node.child_by_field_name("body")
-        if body_node:
-            non_trivial_children = []
-            for child in body_node.children:
-                if child.type == "comment":
-                    continue
-                if child.type == "pass_statement":
-                    continue
-                if child.type == "expression_statement":
-                    # Check if it's a docstring (string literal)
-                    if child.child_count == 1 and child.children[0].type == "string":
-                        continue
-                non_trivial_children.append(child)
-
-            if not non_trivial_children:
-                issues.append(
-                    {
-                        "type": "Improper Implementation",
-                        "subtype": "Empty/Stub Class",
-                        "file": str(filepath),
-                        "line": node.start_point[0] + 1,
-                        "content": node.text.decode("utf8").split("\n")[0] + "...",
-                    }
-                )
-
-    # JS/TS checks
-    elif node.type in (
-        "function_declaration",
-        "method_definition",
-        "arrow_function",
-        "class_declaration",
-    ):
-        body_node = node.child_by_field_name("body")
-        if body_node and body_node.type == "statement_block":
-            # Check if block is empty or only comments
-            non_comment_children = [
-                c for c in body_node.children if c.type not in ("comment", "{", "}")
-            ]
-            if not non_comment_children:
-                issues.append(
-                    {
-                        "type": "Improper Implementation",
-                        "subtype": "Empty/Stub Function/Class",
-                        "file": str(filepath),
-                        "line": node.start_point[0] + 1,
-                        "content": node.text.decode("utf8").split("\n")[0] + "...",
-                    }
-                )
-
-    # Recurse
-    for child in node.children:
-        analyze_node(child, issues, filepath, source_code)
-
-
-def scan_file(filepath):
-    issues = []
-    try:
-        with open(filepath, "rb") as f:  # Read as binary for tree-sitter
-            content = f.read()
-
-        # Regex scanning (always run for comments/patterns)
-        try:
-            text_content = content.decode("utf-8", errors="ignore")
-            lines = text_content.splitlines()
-            for i, line in enumerate(lines):
-                for label, pattern in PATTERNS.items():
-                    # Skip 'pass' and 'NotImplementedError' regex if tree-sitter is active for this file
-                    ext = Path(filepath).suffix
-                    is_parsed = TREE_SITTER_AVAILABLE and ext in (
-                        ".py",
-                        ".js",
-                        ".ts",
-                        ".jsx",
-                        ".tsx",
-                    )
-
-                    if is_parsed and label in ("pass", "NotImplementedError"):
-                        continue
-
-                    if pattern.search(line):
-                        issues.append(
-                            {
-                                "type": "Incomplete/Improper",
-                                "subtype": label,
-                                "file": str(filepath),
-                                "line": i + 1,
-                                "content": line.strip(),
-                            }
-                        )
-
-                # Fallback for simplistic check if tree-sitter not available
-                if not TREE_SITTER_AVAILABLE and "def " in line and "pass" in line:
-                    issues.append(
-                        {
-                            "type": "Improper Implementation",
-                            "subtype": "One-line stub",
-                            "file": str(filepath),
-                            "line": i + 1,
-                            "content": line.strip(),
-                        }
-                    )
-
-        except Exception as e:
-            print(f"Error doing regex scan on {filepath}: {e}")
-
-        # Tree-sitter scanning
-        if TREE_SITTER_AVAILABLE:
-            ext = Path(filepath).suffix
-            lang = None
-            if ext == ".py":
-                lang = "python"
-            elif ext == ".js":
-                lang = "javascript"
-            elif ext == ".ts":
-                lang = "typescript"
-            elif ext in (".jsx", ".tsx"):
-                lang = "tsx"  # simplified
-
-            if lang:
-                parser = get_parser(lang)
-                if parser:
-                    tree = parser.parse(content)
-                    analyze_node(tree.root_node, issues, filepath, content)
-
-    except Exception as e:
-        print(f"Error reading {filepath}: {e}")
-    return issues
-
-
-def get_unused_items():
-    unused = []
-    if os.path.exists(PYRIGHT_OUTPUT):
-        try:
-            with open(PYRIGHT_OUTPUT, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                # Pyright output structure varies, assuming standard JSON output
-                # We look for "diagnostics" with "message" containing "is not accessed"
-                if "generalDiagnostics" in data:
-                    for diag in data["generalDiagnostics"]:
-                        if "is not accessed" in diag.get("message", ""):
-                            unused.append(
-                                {
-                                    "type": "Unused Item",
-                                    "subtype": "Pyright Diagnostic",
-                                    "file": diag.get("file", "unknown"),
-                                    "line": diag.get("range", {})
-                                    .get("start", {})
-                                    .get("line", 0)
-                                    + 1,
-                                    "content": diag.get("message", ""),
-                                }
-                            )
-        except Exception as e:
-            print(f"Error parsing pyright output: {e}")
-    else:
-        print(f"Warning: {PYRIGHT_OUTPUT} not found. Skipping unused item analysis.")
-    return unused
-
-
-def generate_report(issues, unused):
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        f.write("# Code Analysis Issues Report\n\n")
-
-        f.write("## Incomplete & Improper Items\n")
-        if issues:
-            # Sort by file and line
-            issues.sort(key=lambda x: (x["file"], x["line"]))
-
-            for issue in issues:
-                f.write(
-                    f"- **{issue['subtype']}** in `{issue['file']}:{issue['line']}`\n"
-                )
-                f.write(f"  ```\n  {issue['content']}\n  ```\n")
-        else:
-            f.write("No incomplete items found.\n")
-
-        f.write("\n## Unused Items\n")
-        if unused:
-            for item in unused:
-                f.write(f"- **{item['subtype']}** in `{item['file']}:{item['line']}`\n")
-                f.write(f"  > {item['content']}\n")
-        else:
-            f.write("No unused items found (or pyright output missing).\n")
+# ---------------------------------------------------------------------------
+OUTPUT_FILE = os.path.join(project_root, "code_analysis", "issues_report.md")
+OUTPUT_JSON_FILE = os.path.join(project_root, "code_analysis", "issues_report.json")
 
 
 def main():
-    all_issues = []
+    all_issues: List[Dict[str, Any]] = []
 
-    # Get configuration from ConfigManager
     code_roots = config.get_code_root_directories()
     excluded_paths = config.get_excluded_paths()
 
-    # Run pyright to generate analysis data for unused items
+    # ---- pyright ----
     try:
         print("Running pyright for unused item analysis...")
-        with open(PYRIGHT_OUTPUT, "w") as f:
+        # Validate project root
+        safe_project_root = os.path.abspath(os.path.normpath(project_root))
+        if not os.path.isdir(safe_project_root):
+            print(f"Error: Invalid project root directory: {project_root}")
+            return
+
+        # Redirect output to PYRIGHT_OUTPUT in the current working directory or project root
+        pyright_output_path = os.path.join(safe_project_root, PYRIGHT_OUTPUT)
+        with open(pyright_output_path, "w") as f:
             result = subprocess.run(
                 ["pyright", "--outputjson"],
                 stdout=f,
                 stderr=subprocess.STDOUT,
-                cwd=project_root,
+                cwd=safe_project_root,
+                shell=(os.name == "nt"),
             )
         if result.returncode == 0:
             print("Pyright analysis completed successfully.")
         else:
             print(
-                f"Pyright completed with warnings/errors (exit code {result.returncode}). Output file generated."
+                f"Pyright completed with warnings/errors (exit code {result.returncode}). "
+                f"Output file generated."
             )
     except Exception as e:
         print(f"Warning: Unexpected error running pyright: {e}")
 
+    # ---- runtime data ----
+    maybe_run_runtime_inspector(project_root)
+    runtime_data = load_runtime_data(project_root)
+    idx = RuntimeIndex(runtime_data)
+
+    # ---- static walk ----
+    scanned_file_paths: List[str] = []
     print(f"Scanning code roots: {code_roots}")
-
-    # Walk through directories
-    for root_dir in code_roots:
-        # Resolve root_dir relative to project root if needed, but ConfigManager usually returns relative to project root or absolute
-        # Let's ensure we are walking from the project root + code_root
-
-        # We need to handle if code_roots are relative or absolute.
-        # ConfigManager.get_code_root_directories() returns normalized paths, likely relative to project root if they were defined that way in .clinerules
-
-        # Assuming running from project root
-        start_dir = root_dir
+    for root_dir_name in code_roots:
+        # Code roots from config are often relative to project root
+        start_dir = os.path.join(project_root, root_dir_name)
         if not os.path.exists(start_dir):
-            print(f"Warning: Code root {start_dir} does not exist. Skipping.")
-            continue
+            # Try as absolute path
+            start_dir = root_dir_name
+            if not os.path.exists(start_dir):
+                print(f"Warning: Code root {start_dir} does not exist. Skipping.")
+                continue
 
         for root, dirs, files in os.walk(start_dir):
-            # Filter directories
-            # Modify dirs in-place to skip excluded directories
+            # Filter directories in-place
             dirs[:] = [
                 d
                 for d in dirs
@@ -361,23 +117,72 @@ def main():
                     os.path.join(root, d), excluded_paths
                 )
             ]
-
             for file in files:
                 filepath = os.path.join(root, file)
-
                 if path_utils.is_path_excluded(filepath, excluded_paths):
                     continue
-
-                ext = Path(file).suffix
-                if ext not in EXTENSIONS:
+                if Path(file).suffix not in EXTENSIONS:
                     continue
+                scanned_file_paths.append(filepath)
 
-                all_issues.extend(scan_file(filepath))
+    # Batch run static scans concurrently
+    if scanned_file_paths:
+        from cline_utils.dependency_system.utils.batch_processor import BatchProcessor
+        print(f"Scanning {len(scanned_file_paths)} files in parallel...")
+        processor = BatchProcessor(phase_name="Scanning Files", show_progress=True)
+        batch_results = processor.process_items(scanned_file_paths, scan_file)
+        for res in batch_results:
+            if res:
+                all_issues.extend(res)
 
-    unused_items = get_unused_items()
+    # ---- runtime-only findings ----
+    if runtime_data:
+        rt_findings = runtime_only_findings(idx)
+        print(f"[runtime] Added {len(rt_findings)} runtime-only finding(s).")
+        all_issues.extend(rt_findings)
 
-    generate_report(all_issues, unused_items)
+    # ---- enrich every issue with runtime context ----
+    if runtime_data:
+        enriched: List[Dict[str, Any]] = []
+        for it in all_issues:
+            it_enriched = enrich_issue(it, idx)
+            if not it_enriched.get("_suppress"):
+                enriched.append(it_enriched)
+        all_issues = enriched
+    else:
+        # Still attach a basic severity if no runtime data
+        from code_analysis.scanner.runtime_bridge import score_severity
+
+        for it in all_issues:
+            it.setdefault("context", {"severity": score_severity(it, {})})
+
+    # ---- de-dup: same (file, line, subtype) collapses, keep richest ctx ----
+    seen: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
+    for it in all_issues:
+        key = (it.get("file", ""), it.get("line", 0), it.get("subtype", ""))
+        cur = seen.get(key)
+        if cur is None or len((it.get("context") or {})) > len(
+            (cur.get("context") or {})
+        ):
+            seen[key] = it
+    all_issues = list(seen.values())
+
+    unused_items = get_unused_items(project_root)
+
+    # ---- comment index ----
+    print("Building comment index...")
+    comment_index = scan_project_comments(scanned_file_paths)
+    print(
+        f"Comment index: {sum(len(v) for v in comment_index.values())} entries "
+        f"across {len(comment_index)} files."
+    )
+
+    # ---- Generate Reports ----
+    export_json(all_issues, unused_items, OUTPUT_JSON_FILE, comment_index=comment_index)
+    format_markdown(all_issues, unused_items, OUTPUT_FILE, comment_index=comment_index)
+
     print(f"Report generated at {OUTPUT_FILE}")
+    print(f"JSON report at {OUTPUT_JSON_FILE}")
 
 
 if __name__ == "__main__":

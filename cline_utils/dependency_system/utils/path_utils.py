@@ -8,14 +8,11 @@ Handles path normalization, validation, and comparison.
 import fnmatch
 import logging
 import os
-import re
-from typing import List
+from typing import Dict, List, Optional, Tuple
+
+PathMigrationInfo = Dict[str, Tuple[Optional[str], Optional[str]]]
 
 logger = logging.getLogger(__name__)
-
-# <<< *** REMOVED outdated constants *** >>>
-# HIERARCHICAL_KEY_PATTERN = r'^\d+[A-Z][a-z0-9]*$' # Removed
-# KEY_PATTERN = r'\d+|\D+' # Removed
 
 
 def normalize_path(path: str) -> str:
@@ -28,34 +25,47 @@ def normalize_path(path: str) -> str:
     Returns:
         Normalized path
     """
-    from .cache_manager import cached  # Keep import near usage if re-enabled
+    if not path:
+        return ""
+    if not os.path.isabs(path):
+        path = os.path.abspath(path)  # Make absolute based on CWD
+    normalized = os.path.normpath(path).replace("\\", "/")
+    # Uppercase drive letter on Windows for file operation compatibility
+    if (
+        os.name == "nt"
+        and len(normalized) > 1
+        and normalized[1] == ":"
+        and normalized[0].isalpha()
+    ):
+        normalized = normalized[0].upper() + normalized[1:]
+    # Remove trailing slash unless it's the root directory
+    limit = 3 if os.name == "nt" and ":" in normalized else 1
+    if len(normalized) > limit and normalized.endswith("/"):
+        normalized = normalized.rstrip("/")
 
-    @cached("path_normalization", key_func=lambda p: f"normalize:{p if p else 'empty'}")
-    def _normalize_path(p: str) -> str:
-        if not p:
-            return ""
-        # Ensure absolute path before normpath for consistency, especially with relative inputs
-        # Use os.path.abspath cautiously if CWD is not guaranteed to be project root during execution
-        # Let's assume paths passed are either absolute or meant to be relative to CWD when called
-        # If relative paths need resolving against project_root, do it *before* calling normalize_path
-        # However, making it absolute generally prevents unexpected behavior.
-        if not os.path.isabs(p):
-            p = os.path.abspath(p)  # Make absolute based on CWD
-        normalized = os.path.normpath(p).replace("\\", "/")
-        # Lowercase drive letter on Windows for consistency
-        if os.name == "nt" and re.match(r"^[a-zA-Z]:", normalized):
-            normalized = normalized[0].lower() + normalized[1:]
-        # Remove trailing slash unless it's the root directory
-        if len(normalized) > 1 and normalized.endswith("/"):
-            normalized = normalized.rstrip("/")
-        elif (
-            os.name == "nt" and len(normalized) > 3 and normalized.endswith("/")
-        ):  # Handle C:/ case
-            normalized = normalized.rstrip("/")
+    return normalized
 
-        return normalized
 
-    return _normalize_path(path)
+_FILE_TYPE_MAP = {
+    ".py": "py",
+    ".js": "js",
+    ".ts": "js",
+    ".jsx": "js",
+    ".tsx": "js",
+    ".md": "md",
+    ".rst": "md",
+    ".html": "html",
+    ".htm": "html",
+    ".css": "css",
+    ".svelte": "svelte",
+    ".sql": "sql",
+    ".csv": "csv",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".json": "json",
+    ".txt": "txt",
+    ".rs": "rs",
+}
 
 
 def get_file_type(file_path: str) -> str:
@@ -68,34 +78,8 @@ def get_file_type(file_path: str) -> str:
     Returns:
         The file type as a string (e.g., "py", "js", "md", "generic").
     """
-
-    def _get_file_type(fp: str) -> str:
-        _, ext = os.path.splitext(fp)
-        ext = ext.lower()
-        if ext == ".py":
-            return "py"
-        elif ext in (".js", ".ts", ".jsx", ".tsx"):
-            return "js"
-        elif ext in (".md", ".rst"):
-            return "md"
-        elif ext in (".html", ".htm"):
-            return "html"
-        elif ext == ".css":
-            return "css"
-        elif ext == ".svelte":
-            return "svelte"
-        elif ext == ".sql":
-            return "sql"
-        elif ext in (".yaml", ".yml"):
-            return "yaml"
-        elif ext == ".json":
-            return "json"
-        elif ext == ".txt":
-            return "txt"
-        else:
-            return "generic"
-
-    return _get_file_type(file_path)
+    _, ext = os.path.splitext(file_path)
+    return _FILE_TYPE_MAP.get(ext.lower(), "generic")
 
 
 def resolve_relative_path(
@@ -147,11 +131,7 @@ def get_project_root() -> str:
     Returns:
         Path to the project root directory
     """
-    from .cache_manager import cached
 
-    @cached(
-        "project_root", key_func=lambda: f"project_root:{normalize_path(os.getcwd())}"
-    )  # Key depends only on starting CWD
     def _get_project_root() -> str:
         current_dir = os.path.abspath(os.getcwd())
         root_indicators = ["project_root.cfg"]  # Added config file
@@ -258,12 +238,7 @@ def is_valid_project_path(path: str) -> bool:
     Returns:
         True if the path is within the project root, False otherwise
     """
-    from .cache_manager import cached
 
-    @cached(
-        "valid_project_paths",
-        key_func=lambda p: f"valid_project_path:{normalize_path(p)}:{get_project_root()}",
-    )  # Key depends on path and project root value
     def _is_valid_project_path(p: str) -> bool:
         project_root = get_project_root()
         norm_p = normalize_path(p)

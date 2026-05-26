@@ -5,6 +5,99 @@ All notable changes to the Cline Recursive Chain-of-Thought System (CRCT) will b
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [8.6.0] - 2026-05-21
+
+### Added
+- **Platform-Agnostic Cross-Process Locking**: Implemented a robust file-based lock (`CrossProcessLock`) leveraging standard Windows `msvcrt` and POSIX `fcntl` APIs, handling 0-byte locking safely.
+- **Coordinated VRAM Allocation Registry**: Created a dynamic, shared registry (`vram_registry.json`) under the cross-process lock to prevent resource contention and OOMs across concurrent worker processes, including automatic process liveness checks and zombie allocation pruning.
+- **Comprehensive Unit Testing**: Added robust test suites (`test_calculate_hash.py`, `test_cross_process_lock.py`, and `test_vram_process_coordination.py`) covering all new hashing and locking mechanics.
+
+### Changed
+- **Stable Content Hashing Normalization**: Overhauled the hash generation logic in `calculate_hash.py` to strip and normalize carriage returns, varying indent styles, comment prefixes, and empty lines, ensuring stable hashes across development environments.
+- **Transactional Bulk Operations**: Optimized `TransparencyManager` and `dependency_processor` by introducing batch marker transactions (`bulk_restore_markers`, `bulk_remove_markers`), running all alignments and checks in memory and writing to disk exactly once at the end of the transaction.
+- **Parallel Embedding Preparation**: Accelerated `embedding_manager.py` by multithreading file reads, Symbol Essence generation, and tokenization (up to 16 threads), and integrated transparency batching to bypass lock overhead.
+- **Calculated Path Migration Pass-Through**: Passed down pre-computed `path_migration_info` straight through `PlaceholderResolver` and project analyzer to save redundant computational passes.
+
+## [8.5.0] - 2026-05-17
+
+### Added
+- **Precise Symbol-Level Connection Maps**: Connection maps now track precise target symbols and 1-indexed definition lines rather than just file-level mappings, formatted as `KEY(symbol:line) {char}`.
+- **Low-Value Signal Filtration**: Implemented filtering using `_LOW_VALUE_SYMBOL_NAMES` to exclude generic standard built-ins and logger names, focusing maps on actionable business logic dependencies.
+- **Comprehensive Unit Testing**: Added `test_precise_connection_maps.py` with 10 robust test cases covering parsing, symbol resolving, filtering, virtualization, and dry-run code paths.
+
+### Changed
+- **Comment Virtualization**: Upgraded `TransparencyManager` to extract, parse, and store connection maps inside `transparency_registry.json`, stripping physical comments on disk to keep working trees perfectly clean.
+- **Embedding Integration**: Integrated the transparency layer with `embedding_manager.py` to transparently load stripped code contents and append virtual connection maps to the Symbol Essence Strings (SES) to enrich embedding search quality.
+- **Centralized Hash Computation**: Moved all content hash calculations into `cline_utils/dependency_system/utils/calculate_hash.py` to prevent cyclic imports.
+- **Refactored Caching Patterns**: Replaced inline lambda key functions inside decorators with stable named function key generators.
+
+---
+
+## [8.4.0] - 2026-05-08
+
+### Added
+- **Automated Dependency Annotation**: New `populate_comments.py` utility for injecting Station Headers and Connection Maps into source files.
+- **Experimental Native SVG Renderer**: Python-native dependency visualization with intelligent routing and pipe-bundling.
+- **Comment-Aware Reporting**: Integrated `comment_index` scanner into the report generation pipeline.
+- **Agent Comment-Skill Suite**: Comprehensive documentation and plugins for dependency-driven code comments.
+
+### Changed
+- **Deterministic LLM Tasking**: Optimized placeholder resolution by sorting tasks by descending context size to maximize VRAM efficiency.
+- **Improved Reporting**: Enhanced `report_generator` to surface architectural metadata from the new comment system.
+
+### Performance
+- **Optimization**: Refactored dependency resolution to $O(M)$ complexity using global set sharing and batched directory resolution.
+- **Global Path Sharing**: Eliminated redundant path set reconstruction across the dependency resolution loop.
+
+---
+
+## [8.3.0] - 2026-05-03
+
+### Added
+- **Modular Visualization Package**: Extracted dependency visualization logic into a dedicated `cline_utils.dependency_system.utils.viz` sub-package.
+- **Report Generator Modularization**: Refactored monolithic `report_generator.py` into specialized `code_analysis.scanner` and `code_analysis.reporting` packages.
+- **Stable Hashing**: SHA256-based stable hashing for cache keys to ensure persistence across sessions and environments.
+- **Automatic Cache Migration**: Automatic migration of legacy `.json` caches to the new `.pkl` format.
+- **LLM-assisted Placeholder Resolution**: New `PlaceholderResolver` leveraging local LLMs for intelligent dependency verification.
+
+### Changed
+- **Persistent Caching Overhaul**: Switched from JSON to Pickle for more robust Python object serialization in `CacheManager`.
+- **Refactored Visualization**: Decomposed monolithic `visualize_dependencies.py` into specialized modules for DSL building, rendering, and configuration.
+- **Improved Cache Key Generation**: Integrated stable mtime hashing and file dependency tracking in the `@cached` decorator.
+- **Multi-threaded Prefetching**: Optimized dependency resolution loop to overlap CPU tasks with GPU inference.
+- **VRAM Footprint Correction**: Adjusted reranker model memory usage estimates to 0.7GB for better OOM prevention.
+- **Global Cache Budget**: Implemented system-aware memory limits for caches to optimize resource usage.
+
+### Fixed
+- **Documentation Audit & Reconciliation**: Conducted a comprehensive audit of all project documentation (`README.md`, `DEPENDENCY_RESOLUTION.md`, `VIZ_PACKAGE.md`, `REPORTING_SYSTEM.md`) to eliminate hallucinations and align with the v8.3 modular architecture.
+
+---
+
+## [8.2.0] - 2026-02-14
+
+### Added
+- **Local LLM Dependency Resolution**: New commands `resolve-placeholders` and `determine-dependency` for automated verification of 'p' placeholders using GGUF models.
+- **Dual-Token Metadata Schema**: Implementation of `ses_tokens` and `full_tokens` for precise context window management.
+- **Structured Documentation Support**: Parser for `structured_doc_template.md` to enhance semantic embedding quality for requirements and design files.
+- **LOCAL_LLM_GUIDE.md**: New handbook for local LLM resolution and command usage.
+
+### Changed
+- **Dependency-Aware Cache Invalidation**: Cascading invalidation based on logical file dependencies to ensure analysis correctness.
+- **Enhanced Document Analysis**: Improved SES extraction logic for markdown/text files.
+
+---
+
+## [8.1.0] - 2026-01-20
+
+### Added
+- **Tracker Batch Collection**: `TrackerBatchCollector` for atomic, high-performance tracker writes with rollback support.
+- **Report Filtering**: `EXCLUSION_PATTERNS` in `report_generator` to eliminate false positives in code quality analysis.
+
+### Changed
+- **Advanced Caching**: Enhanced `@cached` decorator with dynamic file dependencies and mtime-based invalidation.
+- **Optimized I/O**: Refactored `tracker_io` with local lookup caching.
+- **Windows Path Consistency**: Standardized Uppercase drive letters for cross-environment compatibility.
+
 ---
 
 ## [8.0.0] - 2025-12-02

@@ -8,14 +8,25 @@ Processes command-line arguments and delegates to appropriate handlers.
 import argparse
 import json
 import logging
+from cline_utils.dependency_system.io.file_io import read_file_content_safely
 import os
 import subprocess
 import sys
 from collections import defaultdict
 from logging import LogRecord
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, DefaultDict, Dict, List, Optional, Set, Tuple, Union, cast
 
 from cline_utils.dependency_system.analysis.dependency_analyzer import analyze_file
+from cline_utils.dependency_system.analysis.dependency_suggester import (
+    load_project_symbol_map,
+)
+
+# Type alias for sortable parts
+SortableParts = list[str]
+from cline_utils.dependency_system.analysis.embedding_manager import (
+    generate_symbol_essence_string,
+)
+from cline_utils.dependency_system.analysis.local_llm_processor import LocalLLMProcessor
 
 # --- Analysis Imports ---
 from cline_utils.dependency_system.analysis.project_analyzer import analyze_project
@@ -31,6 +42,7 @@ from cline_utils.dependency_system.core.dependency_grid import (
 )
 from cline_utils.dependency_system.core.key_manager import (
     KeyInfo,
+    get_keymap_indexes,
     get_sortable_parts_for_key,
     load_global_key_map,
     load_old_global_key_map,
@@ -46,20 +58,29 @@ from cline_utils.dependency_system.io.tracker_io import (
     update_tracker,
 )
 from cline_utils.dependency_system.utils.cache_manager import clear_all_caches
+from cline_utils.dependency_system.utils.cache_manager import (
+    get_project_root_cached as get_project_root,
+)
+from cline_utils.dependency_system.utils.cache_manager import (
+    normalize_path_cached as normalize_path,
+)
 from cline_utils.dependency_system.utils.config_manager import ConfigManager
 
 # --- Utility Imports ---
-from cline_utils.dependency_system.utils.path_utils import (
-    get_project_root,
-    normalize_path,
-)
 from cline_utils.dependency_system.utils.template_generator import (
     add_code_doc_dependency_to_checklist,
 )
 from cline_utils.dependency_system.utils.template_generator import (
     get_item_type as get_item_type_for_checklist,
 )
+from cline_utils.dependency_system.utils.tracker_batch_collector import (
+    TrackerBatchCollector,
+    create_doc_tracker_update,
+    create_main_tracker_update,
+    create_mini_tracker_update,
+)
 from cline_utils.dependency_system.utils.tracker_utils import (
+    aggregate_all_dependencies,
     find_all_tracker_paths,
     get_globally_resolved_key_info_for_cli,
     get_key_global_instance_string,
@@ -68,7 +89,24 @@ from cline_utils.dependency_system.utils.tracker_utils import (
     resolve_key_global_instance_to_ki,
 )
 from cline_utils.dependency_system.utils.visualize_dependencies import (
-    generate_mermaid_diagram,
+    generate_dependency_diagram,
+    render_mermaid_to_image,
+)
+from cline_utils.dependency_system.utils.viz.models import NativeLayoutConfig
+
+# --- Exception Imports ---
+from cline_utils.dependency_system.core.exceptions_enhanced import (
+    ProjectAnalyzerError,
+    MemoryLimitError,
+    DiskSpaceError,
+    ResourceValidationError,
+    ModelError,
+    TrackerIOError,
+    TrackerUpdateError,
+    BinaryFileError,
+    EncodingError,
+    ParsingError,
+    FileAnalysisError,
 )
 
 # Configure logging
@@ -80,6 +118,18 @@ KEY_DEFINITIONS_END_MARKER = "---KEY_DEFINITIONS_END---"
 
 
 # --- Helper Functions ---
+def _configure_stdio_for_unicode() -> None:
+    """Avoid UnicodeEncodeError on Windows terminals using legacy code pages."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(errors="backslashreplace")
+            except (OSError, ValueError):
+                pass
+
+
 def _load_global_map_or_exit() -> Dict[str, KeyInfo]:
     """Loads the global key map, exiting if it fails."""
     logger.info("Loading global key map...")
@@ -94,6 +144,44 @@ def _load_global_map_or_exit() -> Dict[str, KeyInfo]:
         sys.exit(1)
     logger.info("Global key map loaded successfully.")
     return path_to_key_info
+
+
+def _load_token_metadata(project_root: str) -> Dict[str, Dict[str, int]]:
+    """Loads token counts from metadata.json."""
+    metadata_path = os.path.join(
+        project_root,
+        "cline_utils",
+        "dependency_system",
+        "analysis",
+        "embeddings",
+        "metadata.json",
+    )
+    token_map: Dict[str, Dict[str, Any]] = {}
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                keys = data.get("keys", {})
+                for key_data in keys.values():
+                    path = key_data.get("path")
+                    if not path:
+                        continue
+                    path = normalize_path(path)
+
+                    ses = key_data.get("ses_tokens")
+                    full = key_data.get("full_tokens")
+
+                    if ses is None and "tokens" in key_data:
+                        ses = key_data["tokens"]
+
+                    if full is None:
+                        full = ses
+
+                    if ses is not None:
+                        token_map[path] = {"ses_tokens": ses, "full_tokens": full}
+        except Exception as e:
+            logger.warning(f"Failed to load token metadata: {e}")
+    return token_map
 
 
 def is_parent_child(
@@ -129,6 +217,133 @@ def is_parent_child(
     return is_parent1 or is_parent2
 
 
+def handle_determine_dependency(args: argparse.Namespace) -> int:
+    """Handle the determine-dependency command."""
+    global_map = _load_global_map_or_exit()
+    config_manager = ConfigManager()
+    project_root = get_project_root()
+
+    # Load token metadata from embeddings/metadata.json
+    embeddings_dir = config_manager.get_path(
+        "embeddings_dir", "cline_utils/dependency_system/analysis/embeddings"
+    )
+    if not os.path.isabs(embeddings_dir):
+        embeddings_dir = os.path.join(project_root, embeddings_dir)
+
+    metadata_path = os.path.join(embeddings_dir, "metadata.json")
+    token_metadata: Dict[str, Any] = {}
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                token_metadata = data.get("keys", {})
+        except Exception as e:
+            logger.warning(f"Failed to load token metadata: {e}")
+
+    # Resolve source key
+    source_ki = resolve_key_global_instance_to_ki(args.source_key, global_map)
+    if not source_ki:
+        print(f"Error: Could not resolve source key '{args.source_key}'")
+        return 1
+
+    # Resolve target key
+    target_ki = resolve_key_global_instance_to_ki(args.target_key, global_map)
+    if not target_ki:
+        print(f"Error: Could not resolve target key '{args.target_key}'")
+        return 1
+
+    source_path = normalize_path(source_ki.norm_path)
+    target_path = normalize_path(target_ki.norm_path)
+
+    if not os.path.exists(source_path):
+        print(f"Error: Source file not found: {source_path}")
+        return 1
+    if not os.path.exists(target_path):
+        print(f"Error: Target file not found: {target_path}")
+        return 1
+
+    # Load symbol map
+    symbol_map = load_project_symbol_map()
+
+    try:
+        # Use SES for source if available
+        if source_path in symbol_map:
+            source_content = generate_symbol_essence_string(
+                source_path, symbol_map[source_path], symbol_map=symbol_map
+            )
+            source_basename = f"{os.path.basename(source_path)} (SES)"
+        else:
+            source_content = read_file_content_safely(source_path)
+            if source_content is None:
+                raise Exception(f"Failed to read source file: {source_path}")
+            source_basename = os.path.basename(source_path)
+
+        # Use SES for target if available
+        if target_path in symbol_map:
+            target_content = generate_symbol_essence_string(
+                target_path, symbol_map[target_path], symbol_map=symbol_map
+            )
+            target_basename = f"{os.path.basename(target_path)} (SES)"
+        else:
+            target_content = read_file_content_safely(target_path)
+            if target_content is None:
+                raise Exception(f"Failed to read target file: {target_path}")
+            target_basename = os.path.basename(target_path)
+
+    except Exception as e:
+        print(f"Error reading files: {e}")
+        return 1
+
+    model_path = args.model
+    if not model_path:
+        model_path = os.path.join(
+            project_root, "models", "Qwen3-4B-Instruct-2507-Q8_0.gguf"
+        )
+
+    if not os.path.exists(model_path):
+        print(f"Error: Model not found at {model_path}")
+        return 1
+
+    try:
+        processor = LocalLLMProcessor(model_path=model_path)
+
+        # Get token counts if available
+        key_data_source = token_metadata.get(source_ki.key_string, {})
+        key_data_target = token_metadata.get(target_ki.key_string, {})
+
+        # Helper to decide token count
+        def get_count_for_key(key_data: Dict[str, Any], is_ses: bool) -> Optional[int]:
+            if is_ses:
+                return key_data.get("ses_tokens", key_data.get("tokens"))
+            return key_data.get("full_tokens", key_data.get("tokens"))
+
+        source_is_ses = source_path in symbol_map
+        target_is_ses = target_path in symbol_map
+
+        source_tokens = get_count_for_key(key_data_source, source_is_ses)
+        target_tokens = get_count_for_key(key_data_target, target_is_ses)
+
+        char, reasoning = processor.determine_dependency(
+            source_content=source_content,
+            target_content=target_content,
+            source_basename=source_basename,
+            target_basename=target_basename,
+            source_tokens=source_tokens,
+            target_tokens=target_tokens,
+        )
+
+        print(f"\nDependency Result: {char}")
+        print(f"Source: {source_ki.key_string} ({source_path})")
+        print(f"Target: {target_ki.key_string} ({target_path})")
+        print(f"\n--- LLM Reasoning ---\n{reasoning}\n---------------------")
+
+        return 0
+    except Exception as e:
+        logger.error(f"Error determining dependency: {e}", exc_info=True)
+        print(f"Error: {e}")
+        return 1
+
+
 # --- Command Handlers ---
 
 
@@ -150,6 +365,29 @@ def command_handler_analyze_file(args: argparse.Namespace) -> int:
         else:
             print(json.dumps(results, indent=2))
         return 0
+    except BinaryFileError as e:
+        print(
+            f"\n[ANALYSIS ERROR] Binary file detected: {e.file_path} (size: {e.file_size} bytes)"
+        )
+        print("Text analysis is not supported for binary files.")
+        return 1
+    except EncodingError as e:
+        print(f"\n[ANALYSIS ERROR] Failed to decode file: {e.file_path}")
+        print(f"Attempted encoding: {e.encoding_attempted}")
+        return 1
+    except ParsingError as e:
+        print(f"\n[ANALYSIS ERROR] Syntax/parsing failure in: {e.file_path}")
+        if e.line_number:
+            print(f"Line number: {e.line_number}")
+        if e.syntax_details:
+            print(f"Syntax details: {e.syntax_details}")
+        return 1
+    except FileAnalysisError as e:
+        print(f"\n[ANALYSIS ERROR] File analysis failed: {e.message}")
+        return 1
+    except ProjectAnalyzerError as e:
+        print(f"\n[ANALYZER ERROR] {e.message}")
+        return 1
     except Exception as e:
         print(f"Error analyzing file: {str(e)}")
         return 1
@@ -184,9 +422,9 @@ def command_handler_analyze_project(args: argparse.Namespace) -> int:
         # Clear validation cache if --force-validate flag is set
         if getattr(args, "force_validate", False):
             try:
-                from .utils.resource_validator import _get_cache_path
+                from .utils.resource_validator import get_cache_path
 
-                cache_path = _get_cache_path()
+                cache_path = get_cache_path()
                 if os.path.exists(cache_path):
                     os.remove(cache_path)
                     logger.info("Cleared validation cache (--force-validate)")
@@ -251,16 +489,37 @@ def command_handler_analyze_project(args: argparse.Namespace) -> int:
         results = analyze_project(
             force_analysis=args.force_analysis, force_embeddings=args.force_embeddings
         )
-        logger.debug(
-            f"All Suggestions before Tracker Update: {results.get('dependency_suggestion', {}).get('suggestions')}"
-        )
+        # logger.debug(
+        #     f"All Suggestions before Tracker Update: {results.get('dependency_suggestion', {}).get('suggestions')}"
+        # )
+
+        # Helper function to make results JSON-serializable by removing AST objects
+        def make_serializable(obj: Any) -> Any:
+            """Recursively remove non-JSON-serializable objects from the results."""
+            if isinstance(obj, dict):
+                # Remove known non-serializable keys
+                cleaned: Dict[str, Any] = {
+                    k: make_serializable(v)
+                    for k, v in cast(Dict[str, Any], obj).items()
+                    if k not in ("_ast_tree", "_ts_tree")
+                }
+                return cleaned
+            elif isinstance(obj, list):
+                return [make_serializable(item) for item in cast(List[Any], obj)]
+            elif isinstance(obj, (str, int, float, bool, type(None))):
+                return obj
+            else:
+                # Convert any other non-serializable objects to string representation
+                return str(obj)
 
         if args.output:
             output_path_abs = normalize_path(os.path.abspath(args.output))
             output_dir = os.path.dirname(output_path_abs)
             os.makedirs(output_dir, exist_ok=True) if output_dir else None
+            # Clean results before JSON serialization
+            serializable_results = make_serializable(results)
             with open(output_path_abs, "w", encoding="utf-8") as f:
-                json.dump(results, f, indent=2)
+                json.dump(serializable_results, f, indent=2)
             print(f"Analysis results saved to {output_path_abs}")
         elif results.get("status") == "success":
             print(
@@ -272,6 +531,65 @@ def command_handler_analyze_project(args: argparse.Namespace) -> int:
             if results.get("status") == "success" or results.get("status") == "warning"
             else 1
         )
+    except MemoryLimitError as e:
+        logger.error(
+            f"Memory limit exceeded: {e.message}", extra={"details": e.details}
+        )
+        print(f"\n[FATAL ERROR] Memory Limit Exceeded!")
+        print(
+            f"Current Memory: {e.current_mb:.1f} MB (Required: {e.required_mb:.1f} MB)"
+        )
+        print(
+            "Please free up system resources or increase memory allocation in config."
+        )
+        return 1
+    except DiskSpaceError as e:
+        logger.error(
+            f"Disk space insufficient: {e.message}", extra={"details": e.details}
+        )
+        print(f"\n[FATAL ERROR] Disk Space Insufficient!")
+        print(f"Path: {e.path}")
+        print(
+            f"Current Space: {e.current_mb:.1f} MB (Required: {e.required_mb:.1f} MB)"
+        )
+        print("Please clean up disk space and try again.")
+        return 1
+    except ResourceValidationError as e:
+        logger.error(
+            f"Resource validation failed: {e.message}", extra={"details": e.details}
+        )
+        print(f"\n[FATAL ERROR] Resource Validation Failed: {e.message}")
+        return 1
+    except ModelError as e:
+        logger.error(f"AI Model Error: {e.message}", extra={"details": e.details})
+        print(
+            f"\n[AI MODEL ERROR] Model '{e.model_name}' failed during '{e.error_type}':"
+        )
+        print(f"Details: {e.message}")
+        print(
+            "Please check your LLM provider status, api keys, or local model runner connection."
+        )
+        return 1
+    except TrackerIOError as e:
+        logger.error(f"Tracker I/O Error: {e.message}", extra={"details": e.details})
+        print(f"\n[TRACKER I/O ERROR] File system operation failed on tracker:")
+        print(f"Tracker Path: {e.tracker_path}")
+        print(f"Operation: {e.operation}")
+        print(f"Details: {e.message}")
+        return 1
+    except TrackerUpdateError as e:
+        logger.error(f"Tracker Update Error: {e.message}", extra={"details": e.details})
+        print(f"\n[TRACKER UPDATE ERROR] Failed to update tracker content:")
+        print(f"Tracker Path: {e.tracker_path}")
+        print(f"Operation: {e.operation}")
+        print(f"Details: {e.message}")
+        return 1
+    except ProjectAnalyzerError as e:
+        logger.error(
+            f"Project Analyzer Error: {e.message}", extra={"details": e.details}
+        )
+        print(f"\n[ANALYZER ERROR] {e.message}")
+        return 1
     except Exception as e:
         logger.error(f"Error analyzing project: {str(e)}", exc_info=True)
         print(f"Error analyzing project: {str(e)}")
@@ -323,154 +641,6 @@ def handle_get_char(args: argparse.Namespace) -> int:
     except Exception as e:
         logger.error(f"Error get_char: {e}")
         print(f"Error: {e}")
-        return 1
-
-
-def handle_set_char(args: argparse.Namespace) -> int:
-    # --- ADDED CRITICAL WARNING ---
-    critical_message = (
-        "CRITICAL WARNING: The 'set_char' command is DEPRECATED and EXTREMELY DANGEROUS "
-        "with the current tracker format. It operates on an outdated understanding of grid structure "
-        "and can EASILY CORRUPT tracker files. It assumes the key you provide uniquely identifies a row, "
-        "and the index refers to an Nth unique key. This is no longer true. "
-        "USE 'add-dependency --tracker <file> --source-key <KEY#GI> --target-key <KEY#GI> --dep-type <char>' INSTEAD "
-        "for targeted changes. PROCEEDING WITH 'set_char' IS AT YOUR OWN RISK AND LIKELY TO BREAK THINGS. "
-        "This command will attempt a best-effort conversion but is not guaranteed to be safe or accurate."
-    )
-    logger.critical(critical_message)
-    print(critical_message)
-    # --- END OF ADDED CRITICAL WARNING ---
-
-    try:
-        tracker_file_path = normalize_path(args.tracker_file)
-        if not os.path.exists(tracker_file_path):
-            print(f"Error: Tracker file not found: {tracker_file_path}")
-            return 1
-
-        with open(tracker_file_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-
-        # Use tracker_io's parsing functions
-        defs_pairs = read_key_definitions_from_lines(lines)
-        _grid_hdrs, grid_rows_list = read_grid_from_lines(lines)
-
-        # Find the first definition matching args.key to get its path and original index
-        source_row_original_idx = -1
-        source_path_targetted = None
-        # The key from args.key is a KEY_LABEL from the tracker file (could be KEY or KEY#GI)
-        for idx, (k_label_in_file, p_str) in enumerate(defs_pairs):
-            if k_label_in_file == args.key:
-                source_row_original_idx = idx
-                source_path_targetted = p_str
-                break
-
-        if source_row_original_idx == -1 or source_path_targetted is None:
-            print(
-                f"Error: Source key label '{args.key}' not found in tracker definitions."
-            )
-            return 1
-
-        if source_row_original_idx >= len(grid_rows_list):
-            print(
-                f"Error: Grid data for source key label '{args.key}' (def index {source_row_original_idx}) seems missing or tracker is corrupt."
-            )
-            return 1
-
-        target_col_logical_index = (
-            args.index
-        )  # This index refers to the Nth definition in the *original* file
-        if not (0 <= target_col_logical_index < len(defs_pairs)):
-            print(
-                f"Error: Target column index {target_col_logical_index} is out of range for {len(defs_pairs)} definitions."
-            )
-            return 1
-
-        target_path_targetted: str = defs_pairs[target_col_logical_index][1]
-        target_key_label_targetted: str = defs_pairs[target_col_logical_index][0]
-
-        print(
-            f"\n--- Attempting to set relationship for paths (via low-level 'set_char' command) ---"
-        )
-        print(
-            f"  Source (from tracker def): '{args.key}' (Path: {source_path_targetted})"
-        )
-        print(
-            f"  Target (from tracker def): '{target_key_label_targetted}' (Path: {target_path_targetted}) at original column index {target_col_logical_index}"
-        )
-        print(f"  New Char to set: '{args.char}'")
-        print(
-            f"-------------------------------------------------------------------------------------\n"
-        )
-
-        global_map = _load_global_map_or_exit()
-
-        # Find the KeyInfo for source and target paths to get their current global keys
-        src_ki_global = global_map.get(source_path_targetted)
-        tgt_ki_global = global_map.get(target_path_targetted)
-
-        if not src_ki_global:
-            print(
-                f"Error: Source path '{source_path_targetted}' (from key '{args.key}') not found in current global map. Aborting 'set_char'."
-            )
-            return 1
-        if not tgt_ki_global:
-            print(
-                f"Error: Target path '{target_path_targetted}' (from target key label '{target_key_label_targetted}') not found in current global map. Aborting 'set_char'."
-            )
-            return 1
-
-        # Construct KEY#GI strings for the suggestion
-        source_key_for_sugg = get_key_global_instance_string(src_ki_global, global_map)
-        target_key_for_sugg = get_key_global_instance_string(tgt_ki_global, global_map)
-
-        if not source_key_for_sugg or not target_key_for_sugg:
-            print(
-                "Error: Could not determine KEY#GlobalInstance for source or target. Aborting 'set_char'."
-            )
-            return 1
-
-        suggestions_for_set_char = {
-            source_key_for_sugg: [(target_key_for_sugg, args.char)]
-        }
-
-        is_mini = tracker_file_path.endswith("_module.md")
-        tracker_type_val = (
-            "mini"
-            if is_mini
-            else (
-                "doc"
-                if "doc_tracker.md" in os.path.basename(tracker_file_path)
-                else "main"
-            )
-        )
-        f_to_m_map = {
-            _info.norm_path: _info.parent_path
-            for _info in global_map.values()
-            if not _info.is_directory and _info.parent_path
-        }
-
-        update_tracker(
-            output_file_suggestion=tracker_file_path,
-            path_to_key_info=global_map,
-            tracker_type=tracker_type_val,
-            suggestions_external=suggestions_for_set_char,
-            file_to_module=f_to_m_map,
-            force_apply_suggestions=True,  # Force this specific change
-            apply_ast_overrides=False,  # <<< MODIFIED/ADDED
-        )
-        print(
-            f"Applied 'set_char' for source '{args.key}' targeting original column index {args.index} with char '{args.char}' "
-            f"in {tracker_file_path} via forced update. VERIFY THE RESULT CAREFULLY in the tracker file."
-        )
-        return 0
-
-    except Exception as e:
-        logger.error(
-            f"Error during 'set_char' for {args.tracker_file}: {e}", exc_info=True
-        )
-        print(
-            f"Error during 'set_char': {e}. The tracker might be in an inconsistent state."
-        )
         return 1
 
 
@@ -564,7 +734,9 @@ def handle_add_dependency(args: argparse.Namespace) -> int:
     dep_type: str = args.dep_type
 
     # --- Import moved for early use ---
-    from cline_utils.dependency_system.io.update_doc_tracker import doc_tracker_data
+    from cline_utils.dependency_system.io.update_doc_tracker import (
+        doc_file_inclusion_logic,
+    )
 
     # ---
 
@@ -609,7 +781,7 @@ def handle_add_dependency(args: argparse.Namespace) -> int:
     # --- Pre-filter valid paths if tracker type requires it (e.g., 'doc') ---
     valid_paths_for_tracker: Optional[Set[str]] = None
     if tracker_type_val_add == "doc":
-        filtered_items_map: Dict[str, KeyInfo] = doc_tracker_data["file_inclusion"](
+        filtered_items_map: Dict[str, KeyInfo] = doc_file_inclusion_logic(
             project_root, global_map
         )
         valid_paths_for_tracker = set(filtered_items_map.keys())
@@ -659,15 +831,16 @@ def handle_add_dependency(args: argparse.Namespace) -> int:
             for ki in matching_source_infos:
                 print(f"  - {ki.key_string} (Path: {ki.norm_path})")
             return 1
-    elif len(matching_source_infos) > 1:
-        print(
-            f"Error: Source key '{src_base_key_str}' is globally ambiguous. Please specify which instance you mean using '#<num>':"
-        )
-        for ki in matching_source_infos:
-            print(f"  - {ki.key_string} (Path: {ki.norm_path})")
-        return 1
     else:
-        resolved_source_ki = matching_source_infos[0]
+        if len(matching_source_infos) > 1:
+            print(
+                f"Error: Source key '{src_base_key_str}' is globally ambiguous. Please specify which instance you mean using '#<num>':"
+            )
+            for ki in matching_source_infos:
+                print(f"  - {ki.key_string} (Path: {ki.norm_path})")
+            return 1
+        else:
+            resolved_source_ki = matching_source_infos[0]
 
     if not resolved_source_ki:
         return 1
@@ -758,16 +931,19 @@ def handle_add_dependency(args: argparse.Namespace) -> int:
                     (tgt_key_arg_item_raw, "Invalid global instance number.")
                 )
                 continue
-        elif len(matching_target_infos) > 1:
-            print(
-                f"Error: Target key '{tgt_base_key_str}' is globally ambiguous. Please specify which instance you mean using '#<num>':"
-            )
-            for ki in matching_target_infos:
-                print(f"  - {ki.key_string} (Path: {ki.norm_path})")
-            rejected_targets.append((tgt_key_arg_item_raw, "Globally ambiguous key."))
-            continue
         else:
-            resolved_target_ki = matching_target_infos[0]
+            if len(matching_target_infos) > 1:
+                print(
+                    f"Error: Target key '{tgt_base_key_str}' is globally ambiguous. Please specify which instance you mean using '#<num>':"
+                )
+                for ki in matching_target_infos:
+                    print(f"  - {ki.key_string} (Path: {ki.norm_path})")
+                rejected_targets.append(
+                    (tgt_key_arg_item_raw, "Globally ambiguous key.")
+                )
+                continue
+            else:
+                resolved_target_ki = matching_target_infos[0]
 
         if not resolved_target_ki:
             # This case is already covered by the ambiguity/resolution logic above, but as a safeguard:
@@ -966,11 +1142,38 @@ def handle_merge_trackers(args: argparse.Namespace) -> int:
 
 def handle_clear_caches(args: argparse.Namespace) -> int:
     try:
-        clear_all_caches()
-        print("All caches cleared.")
+        clear_all_caches(wipe=True)
+        print("All caches wiped from memory and disk.")
         return 0
     except Exception as e:
         logger.exception(f"Error clearing caches: {e}")
+        print(f"Error: {e}")
+        return 1
+
+
+def handle_build_context(args: argparse.Namespace) -> int:
+    """Handles the CLI request to build a targeted LLM context package."""
+    try:
+        from pathlib import Path
+        from cline_utils.dependency_system.io.context_packager import ContextPackager
+
+        packager = ContextPackager()
+        target_keys = [k.strip() for k in args.keys.split(",")]
+
+        payload = packager.build_package(
+            target_keys=target_keys, max_tokens=args.max_tokens, routing_mode=args.mode
+        )
+
+        if args.output:
+            output_path = Path(args.output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(payload, encoding="utf-8")
+            print(f"Context package successfully written to {output_path}")
+        else:
+            print(payload)
+        return 0
+    except Exception as e:
+        logger.exception(f"Error building context package: {e}")
         print(f"Error: {e}")
         return 1
 
@@ -1045,6 +1248,7 @@ def handle_show_dependencies(args: argparse.Namespace) -> int:
     current_global_map = _load_global_map_or_exit()  # path_to_key_info
     config = ConfigManager()
     project_root = get_project_root()
+    token_map = _load_token_metadata(project_root)
 
     parts = user_provided_key_arg.split("#")
     base_key_to_show = parts[0]
@@ -1103,8 +1307,11 @@ def handle_show_dependencies(args: argparse.Namespace) -> int:
         )
         return 1
 
+    token_count = token_map.get(target_ki_to_show.norm_path)
+    token_info = f" [Tokens: {token_count}]" if token_count is not None else ""
+
     print(
-        f"\n--- Dependencies for: {target_key_gi_str_to_show} (Path: {target_ki_to_show.norm_path}) ---"
+        f"\n--- Dependencies for: {target_key_gi_str_to_show} (Path: {target_ki_to_show.norm_path}){token_info} ---"
     )
 
     # Pre-calculate global counts for display formatting
@@ -1261,8 +1468,11 @@ def handle_show_dependencies(args: argparse.Namespace) -> int:
                 else ""
             )
 
+            token_count = token_map.get(interacting_ki.norm_path)
+            token_info = f" [Tokens: {token_count}]" if token_count is not None else ""
+
             print(
-                f"  - {display_name_interacting}: {interacting_ki.norm_path}{origins_str}"
+                f"  - {display_name_interacting}: {interacting_ki.norm_path}{token_info}{origins_str}"
             )
 
     print("\n------------------------------------------")
@@ -1281,6 +1491,9 @@ def handle_show_keys(args: argparse.Namespace) -> int:
     logger.info(
         f"Attempting to show keys and check status (p, s, S) from tracker: {tracker_path}"
     )
+
+    project_root = get_project_root()
+    token_map = _load_token_metadata(project_root)
 
     if not os.path.exists(tracker_path):
         print(f"Error: Tracker file not found: {tracker_path}", file=sys.stderr)
@@ -1371,6 +1584,10 @@ def handle_show_keys(args: argparse.Namespace) -> int:
                 f"{key_str_in_file}: {path_str_in_file}{global_instance_suffix}{status_indicator}"
             )
 
+            token_count = token_map.get(normalize_path(path_str_in_file))
+            if token_count is not None:
+                print(f"    | Tokens: {token_count}")
+
         print("--- End of Key Definitions ---")
         try:
             with open(tracker_path, "r", encoding="utf-8") as f_check:
@@ -1403,14 +1620,12 @@ def handle_show_placeholders(args: argparse.Namespace) -> int:
     """
     Handle the show-placeholders command.
     Finds and displays all unverified dependencies ('p', 's', 'S').
+
+    When --tracker is provided: shows detailed per-key breakdown for that tracker.
+    When --tracker is omitted: shows aggregate summary across all trackers from tracker_map.json.
     """
-    tracker_path = normalize_path(args.tracker)
     focus_key = args.key
     dep_char_filter = args.dep_char
-
-    if not os.path.exists(tracker_path):
-        print(f"Error: Tracker file not found: {tracker_path}", file=sys.stderr)
-        return 1
 
     chars_to_check: Tuple[str, ...]
     if dep_char_filter:
@@ -1418,9 +1633,88 @@ def handle_show_placeholders(args: argparse.Namespace) -> int:
     else:
         chars_to_check = ("p", "s", "S")
 
+    # --- Bare mode: no --tracker provided, show aggregate summary across all trackers ---
+    if args.tracker is None:
+        from cline_utils.dependency_system.core.key_manager import (
+            load_tracker_map,
+        )
+
+        all_trackers = load_tracker_map()
+        if not all_trackers:
+            print(
+                "Error: No tracker map found. Run 'analyze-project' first.",
+                file=sys.stderr,
+            )
+            return 1
+
+        results: List[Tuple[str, int, int, int]] = (
+            []
+        )  # (tracker_rel_path, p_count, s_count, S_count)
+        total_p = total_s = total_S = 0
+
+        for t_path in all_trackers:
+            if not os.path.exists(t_path):
+                continue
+            try:
+                with open(t_path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                key_def_pairs = read_key_definitions_from_lines(lines)
+                _grid_headers, grid_rows_data = read_grid_from_lines(lines)
+                if not key_def_pairs or not grid_rows_data:
+                    continue
+            except Exception:
+                continue
+
+            p_cnt = s_cnt = S_cnt = 0
+            for _, (row_label, compressed_row) in enumerate(grid_rows_data):
+                if focus_key and row_label != focus_key:
+                    continue
+                try:
+                    decompressed = decompress(compressed_row)
+                    if len(decompressed) != len(key_def_pairs):
+                        continue
+                    for char in decompressed:
+                        if char in chars_to_check:
+                            if char == "p":
+                                p_cnt += 1
+                            elif char == "s":
+                                s_cnt += 1
+                            elif char == "S":
+                                S_cnt += 1
+                except Exception:
+                    continue
+
+            if p_cnt or s_cnt or S_cnt:
+                # Use relative path for cleaner output
+                rel_path = os.path.relpath(t_path, get_project_root())
+                results.append((rel_path, p_cnt, s_cnt, S_cnt))
+                total_p += p_cnt
+                total_s += s_cnt
+                total_S += S_cnt
+
+        if not results:
+            print(f"No unverified dependencies {chars_to_check} found in any tracker.")
+            return 0
+
+        for rel_path, p_cnt, s_cnt, S_cnt in results:
+            print(f"{rel_path} - p:{p_cnt} | s:{s_cnt} | S:{S_cnt}")
+        print("---")
+        total_all = total_p + total_s + total_S
+        print(f"Total Unresolved dependencies: {total_all}")
+        return 0
+
+    # --- Detailed mode: --tracker provided ---
+    tracker_path = normalize_path(args.tracker)
+
+    if not os.path.exists(tracker_path):
+        print(f"Error: Tracker file not found: {tracker_path}", file=sys.stderr)
+        return 1
+
     # --- Load Global Map for Path Resolution ---
+    project_root = get_project_root()
+    token_map = _load_token_metadata(project_root)
     global_map = load_global_key_map()
-    key_to_path_map = {}
+    key_to_path_map: Dict[str, str] = {}
     if global_map:
         for k_info in global_map.values():
             key_to_path_map[k_info.key_string] = k_info.norm_path
@@ -1445,7 +1739,7 @@ def handle_show_placeholders(args: argparse.Namespace) -> int:
             print(f"Error: Key '{focus_key}' not found as a row in {tracker_path}.")
             return 1
 
-        for row_idx, (row_label, compressed_row) in enumerate(grid_rows_data):
+        for _, (row_label, compressed_row) in enumerate(grid_rows_data):
             if focus_key and row_label != focus_key:
                 continue
 
@@ -1482,8 +1776,16 @@ def handle_show_placeholders(args: argparse.Namespace) -> int:
             unverified_deps.keys(), key=get_sortable_parts_for_key
         )
         for source_label in sorted_source_keys:
-            source_path = key_to_path_map.get(source_label, "Path not found")
-            print(f"\n--- Key: {source_label} (Path: {source_path}) ---")
+            source_path: str = key_to_path_map.get(source_label, "Path not found")
+            source_token_count = token_map.get(normalize_path(source_path))
+            source_token_info = (
+                f" [Tokens: {source_token_count}]"
+                if source_token_count is not None
+                else ""
+            )
+            print(
+                f"\n--- Key: {source_label} (Path: {source_path}){source_token_info} ---"
+            )
             char_map = unverified_deps[source_label]
             for char_type in sorted(char_map.keys()):
                 target_labels = sorted(
@@ -1491,8 +1793,14 @@ def handle_show_placeholders(args: argparse.Namespace) -> int:
                 )
                 print(f"  {char_type}:")
                 for tgt in target_labels:
-                    tgt_path = key_to_path_map.get(tgt, "Path not found")
-                    print(f"    - {tgt} (Path: {tgt_path})")
+                    tgt_path: str = key_to_path_map.get(tgt, "Path not found")
+                    tgt_token_count = token_map.get(normalize_path(tgt_path))
+                    tgt_token_info = (
+                        f" [Tokens: {tgt_token_count}]"
+                        if tgt_token_count is not None
+                        else ""
+                    )
+                    print(f"    - {tgt} (Path: {tgt_path}){tgt_token_info}")
 
         return 0
 
@@ -1511,18 +1819,23 @@ def handle_visualize_dependencies(args: argparse.Namespace) -> int:
     """Handles the visualize-dependencies command by calling the core generation function."""
     focus_keys_list_cli: List[str] = args.key if args.key is not None else []
     output_format_cli = args.format.lower()
+    backend_cli = getattr(args, "backend", None) or (
+        "native" if output_format_cli == "svg" else "mermaid"
+    )
     output_path_arg_cli = args.output
 
     logger.info(
         f"CLI: visualize-dependencies called. Focus Keys: {focus_keys_list_cli or 'Project Overview'}"
     )
 
-    if output_format_cli != "mermaid":
-        print(f"Error: Only 'mermaid' format supported at this time.")
+    if output_format_cli == "svg" and getattr(args, "backend", None) is None:
+        backend_cli = "native"
+    if backend_cli not in {"mermaid", "native", "isometric", "threejs"}:
+        print(f"Error: Unsupported visualization backend '{backend_cli}'.")
         return 1
 
     try:
-        current_global_map_cli = _load_global_map_or_exit()
+        current_global_map_cli = _load_global_map_or_exit()  # path_to_key_info
         config_cli = ConfigManager()
         project_root_cli = get_project_root()
         # Use find_all_tracker_paths from tracker_utils (was tracker_io before)
@@ -1563,29 +1876,36 @@ def handle_visualize_dependencies(args: argparse.Namespace) -> int:
         print(f"Error loading data needed for visualization: {e}", file=sys.stderr)
         return 1
 
-    mermaid_string_generated = generate_mermaid_diagram(
+    render_stage_cli = getattr(args, "render_stage", None)
+    if render_stage_cli is None:
+        render_stage_cli = 1 if backend_cli == "isometric" else 5
+
+    diagram_string_generated = generate_dependency_diagram(
         focus_keys_list_input=focus_keys_list_cli,
         global_path_to_key_info_map=current_global_map_cli,
         path_migration_info=path_migration_info_cli,
         all_tracker_paths_list=list(all_tracker_paths_cli),
         config_manager_instance=config_cli,
+        backend=backend_cli,
+        render=False,
+        native_config=NativeLayoutConfig(render_stage=render_stage_cli),
     )
 
-    if mermaid_string_generated is None:
+    if diagram_string_generated is None:
         print(
-            "Error: Mermaid diagram generation failed internally. Check logs.",
+            "Error: Dependency diagram generation failed internally. Check logs.",
             file=sys.stderr,
         )
         return 1
-    elif "Error:" in mermaid_string_generated[:20]:
-        print(mermaid_string_generated, file=sys.stderr)
+    elif "Error:" in diagram_string_generated[:20]:
+        print(diagram_string_generated, file=sys.stderr)
         return 1
-    elif "// No relevant data" in mermaid_string_generated:
+    elif "No relevant data" in diagram_string_generated:
         print(
             "Info: No relevant data found to visualize based on focus keys and filters."
         )
     else:
-        logger.debug("Mermaid code generated successfully.")
+        logger.debug(f"{backend_cli} visualization generated successfully.")
 
     output_path_cli = output_path_arg_cli
     if not output_path_cli:
@@ -1621,9 +1941,29 @@ def handle_visualize_dependencies(args: argparse.Namespace) -> int:
             max_len = 50
             if len(safe_keys_str) > max_len:
                 safe_keys_str = safe_keys_str[:max_len] + "_etc"
-            default_filename = f"focus_{safe_keys_str}_dependencies.{output_format_cli}"
+            if backend_cli == "threejs":
+                ext = "html"
+                suffix = "_threejs"
+            else:
+                ext = (
+                    "svg"
+                    if backend_cli in {"native", "isometric"}
+                    else output_format_cli
+                )
+                suffix = "_isometric" if backend_cli == "isometric" else ""
+            default_filename = f"focus_{safe_keys_str}_dependencies{suffix}.{ext}"
         else:
-            default_filename = f"project_overview_dependencies.{output_format_cli}"
+            if backend_cli == "threejs":
+                ext = "html"
+                suffix = "_threejs"
+            else:
+                ext = (
+                    "svg"
+                    if backend_cli in {"native", "isometric"}
+                    else output_format_cli
+                )
+                suffix = "_isometric" if backend_cli == "isometric" else ""
+            default_filename = f"project_overview_dependencies{suffix}.{ext}"
 
         memory_dir_rel = config_cli.get_path("memory_dir", "cline_docs")
         default_output_dir_rel = os.path.join(memory_dir_rel, "dependency_diagrams")
@@ -1645,11 +1985,24 @@ def handle_visualize_dependencies(args: argparse.Namespace) -> int:
             os.makedirs(output_dir_cli, exist_ok=True)
 
         with open(output_path_cli, "w", encoding="utf-8") as f_out:
-            f_out.write(mermaid_string_generated)
+            f_out.write(diagram_string_generated)
 
-        logger.info(f"Successfully wrote Mermaid visualization to: {output_path_cli}")
+        logger.info(
+            f"Successfully wrote dependency visualization to: {output_path_cli}"
+        )
         print(f"\nDependency visualization saved to: {output_path_cli}")
-        if "// No relevant data" not in mermaid_string_generated:
+        if (
+            backend_cli == "mermaid"
+            and "No relevant data" not in diagram_string_generated
+            and not diagram_string_generated.startswith("Error:")
+        ):
+            rendered_svg_path = os.path.splitext(output_path_cli)[0] + ".svg"
+            render_mermaid_to_image(diagram_string_generated, rendered_svg_path)
+            print(f"Rendered Mermaid SVG saved to: {rendered_svg_path}")
+        if (
+            "No relevant data" not in diagram_string_generated
+            and backend_cli == "mermaid"
+        ):
             print(
                 "You can view this file using Mermaid Live Editor (mermaid.live) or compatible Markdown viewers."
             )
@@ -1671,8 +2024,908 @@ def handle_visualize_dependencies(args: argparse.Namespace) -> int:
         return 1
 
 
+from cline_utils.dependency_system.utils.placeholder_resolver import PreparedPair
+
+
+def _prepare_pair(
+    srckey: str,
+    srcpath: str,
+    tgtkey: str,
+    tgtpath: str,
+    symbol_map: Dict[str, Any],
+    token_map: Dict[str, Any],
+    max_model_tokens: int,
+    wrapper_overhead: int,
+) -> PreparedPair:
+    """
+    All CPU-side work for one pair: normalize, SES, file read, token count.
+    Runs in a prefetch thread while GPU handles the previous pair.
+    """
+    src_norm = normalize_path(srcpath)
+    tgt_norm = normalize_path(tgtpath)
+    src_is_ses = src_norm in symbol_map
+    tgt_is_ses = tgt_norm in symbol_map
+
+    def _get_tokens(path_norm: str, is_ses: bool) -> int:
+        data = token_map.get(path_norm, {})
+        if is_ses:
+            val = data.get("ses_tokens", data.get("tokens"))
+        else:
+            val = data.get("full_tokens", data.get("tokens"))
+        return val if val is not None else 0
+
+    stokens = _get_tokens(src_norm, src_is_ses)
+    ttokens = _get_tokens(tgt_norm, tgt_is_ses)
+
+    # Token limit pre-check
+    if stokens > 0 and ttokens > 0:
+        total_est = stokens + ttokens + wrapper_overhead
+        if total_est > max_model_tokens:
+            return PreparedPair(
+                srckey=srckey,
+                srcpath=srcpath,
+                tgtkey=tgtkey,
+                tgtpath=tgtpath,
+                srccontent="",
+                tgtcontent="",
+                srcbase="",
+                tgtbase="",
+                stokens=stokens,
+                ttokens=ttokens,
+                skip=True,
+                skip_reason=f"Combined tokens {total_est} exceed limit {max_model_tokens}",
+            )
+
+    # File reads
+    try:
+        srccontent = read_file_content_safely(srcpath)
+        if srccontent is None:
+            raise Exception("Failed to read src")
+        tgtcontent = read_file_content_safely(tgtpath)
+        if tgtcontent is None:
+            raise Exception("Failed to read tgt")
+    except Exception as e:
+        return PreparedPair(
+            srckey=srckey,
+            srcpath=srcpath,
+            tgtkey=tgtkey,
+            tgtpath=tgtpath,
+            srccontent="",
+            tgtcontent="",
+            srcbase="",
+            tgtbase="",
+            stokens=stokens,
+            ttokens=ttokens,
+            skip=True,
+            skip_reason=f"File read error: {e}",
+        )
+
+    srcbase = os.path.basename(srcpath)
+    tgtbase = os.path.basename(tgtpath)
+
+    # SES substitution
+    if src_is_ses:
+        srccontent = generate_symbol_essence_string(
+            src_norm, symbol_map[src_norm], symbol_map=symbol_map
+        )
+        srcbase = f"{srcbase} (SES)"
+    if tgt_is_ses:
+        tgtcontent = generate_symbol_essence_string(
+            tgt_norm, symbol_map[tgt_norm], symbol_map=symbol_map
+        )
+        tgtbase = f"{tgtbase} (SES)"
+
+    return PreparedPair(
+        srckey=srckey,
+        srcpath=srcpath,
+        tgtkey=tgtkey,
+        tgtpath=tgtpath,
+        srccontent=srccontent,
+        tgtcontent=tgtcontent,
+        srcbase=srcbase,
+        tgtbase=tgtbase,
+        stokens=stokens,
+        ttokens=ttokens,
+    )
+
+
+def handle_resolve_placeholders(args: argparse.Namespace) -> int:
+    """
+    Resolve placeholders using Local LLM in batches.
+    """
+
+    if not hasattr(args, "_processed_pairs"):
+        args._processed_pairs = set()
+    if not hasattr(args, "accumulated_tracker_updates"):
+        args.accumulated_tracker_updates = []
+
+    _raw_pairs = getattr(args, "_processed_pairs")
+    processed_pairs = cast(Set[Tuple[str, str, str, str]], _raw_pairs)
+
+    limit = args.limit
+    dep_char = args.dep_char
+    focus_key = args.key
+
+    if args.tracker is None:
+        from cline_utils.dependency_system.core.key_manager import (
+            load_tracker_map,
+            save_tracker_map,
+        )
+
+        all_trackers = load_tracker_map()
+        if not all_trackers:
+            print(
+                "Tracker map not found or empty. Scanning project to generate it...",
+                file=sys.stderr,
+            )
+            all_trackers = list(
+                find_all_tracker_paths(
+                    ConfigManager(), get_project_root(), force_scan=True
+                )
+            )
+            if all_trackers:
+                save_tracker_map(all_trackers)
+                print(
+                    f"Generated tracker map with {len(all_trackers)} entries.",
+                    file=sys.stderr,
+                )
+            else:
+                print("Error: No trackers found in the project.", file=sys.stderr)
+                return 1
+
+        doc_trackers: List[str] = []
+        mini_trackers: List[str] = []
+        main_trackers: List[str] = []
+        for t in all_trackers:
+            basename = os.path.basename(t)
+            if "doc_tracker.md" in basename:
+                doc_trackers.append(t)
+            elif basename.endswith("_module.md"):
+                mini_trackers.append(t)
+            elif "module_relationship_tracker.md" in basename:
+                main_trackers.append(t)
+
+        trackers_to_scan = doc_trackers + mini_trackers + main_trackers
+        dep_chars = ("p", "S", "s") if dep_char == "p" else (dep_char,)
+    else:
+        tracker_path: str = str(normalize_path(args.tracker))
+        if not os.path.isfile(tracker_path):
+            print(
+                f"Error: Tracker file not found or is a directory: {tracker_path}",
+                file=sys.stderr,
+            )
+            return 1
+        trackers_to_scan = [tracker_path]
+        dep_chars = (dep_char,)
+
+    model_path = args.model if args.model else "models/Qwen3-4B-Instruct-2507-Q8_0.gguf"
+
+    # Load Global Map and derived indexes
+    global_map = _load_global_map_or_exit()
+    indexes = get_keymap_indexes()
+    is_dir_map = indexes.get("is_dir_map", {})
+    file_descendants_by_dir = indexes.get("file_descendants_by_dir", {})
+    ancestor_chain = indexes.get("ancestor_chain", {})
+
+    # --- PREPARATION ---
+    config_mgr = ConfigManager()
+    get_prio = config_mgr.get_char_priority
+    all_tp = find_all_tracker_paths(config_mgr, get_project_root())
+    old_global_map = load_old_global_key_map()
+    path_migration_info = build_path_migration_map(old_global_map, global_map)
+
+    # Build Global Edges Map (Aggregated from all trackers)
+    agg_deps = aggregate_all_dependencies(
+        tracker_paths=all_tp,
+        path_migration_info=path_migration_info,
+        current_global_path_to_key_info=global_map,
+        show_progress=False,
+    )
+    edges: DefaultDict[str, Dict[str, str]] = defaultdict(dict)
+    gi_to_path = {ki.key_string: p for p, ki in global_map.items()}
+    for (src_gi, tgt_gi), (char, _) in agg_deps.items():
+        s_path = gi_to_path.get(src_gi)
+        t_path = gi_to_path.get(tgt_gi)
+        if s_path and t_path:
+            edges[s_path][t_path] = char
+
+    import time
+
+    # ---------------------------------------------------------
+    # GLOBAL PHASE 1 & 2: Algorithmic Resolution across ALL trackers
+    # ---------------------------------------------------------
+    global_suggestions: DefaultDict[str, DefaultDict[str, List[Tuple[str, str]]]] = (
+        defaultdict(lambda: defaultdict(list))
+    )
+
+    algo_processed_count = 0
+    shortcut_processed_count = 0
+
+    # Collect all algorithmic/shortcut tasks globally
+    for t_path in trackers_to_scan:
+        if not os.path.isfile(t_path):
+            continue
+
+        try:
+            with open(t_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            key_def_pairs = read_key_definitions_from_lines(lines)
+            _, grid_rows_data = read_grid_from_lines(lines)
+        except Exception:
+            continue
+
+        if not key_def_pairs or not grid_rows_data:
+            continue
+
+        for row_idx, (row_label, compressed_row) in enumerate(grid_rows_data):
+            if focus_key and row_label != focus_key:
+                continue
+            if row_idx >= len(key_def_pairs):
+                continue
+
+            _, src_path = key_def_pairs[row_idx]
+            if not src_path or not os.path.exists(src_path):
+                continue
+
+            try:
+                decomp = list(decompress(compressed_row))
+                for col_idx, char in enumerate(decomp):
+                    if char in dep_chars and col_idx < len(key_def_pairs):
+                        tgt_key_label, tgt_path = key_def_pairs[col_idx]
+                        if tgt_path and os.path.exists(tgt_path):
+                            if (
+                                t_path,
+                                row_label,
+                                tgt_key_label,
+                                char,
+                            ) in processed_pairs:
+                                continue
+
+                            sn = normalize_path(src_path)
+                            tn = normalize_path(tgt_path)
+
+                            # Check Shortcut 1A (Global Cache)
+                            existing_global_char = edges.get(sn, {}).get(tn)
+                            if existing_global_char and existing_global_char in (
+                                "x",
+                                "<",
+                                ">",
+                                "d",
+                                "n",
+                            ):
+                                global_suggestions[t_path][row_label].append(
+                                    (tgt_key_label, existing_global_char)
+                                )
+                                processed_pairs.add(
+                                    (t_path, row_label, tgt_key_label, char)
+                                )
+                                shortcut_processed_count += 1
+                                logger.info(
+                                    f"Shortcut: Resolved {row_label} -> {tgt_key_label}: '{existing_global_char}' (Propagated from global cache)"
+                                )
+                                continue
+
+                            # Check Shortcut 1B (Parent-Child)
+                            is_pc = (
+                                sn == tn
+                                or sn in ancestor_chain.get(tn, ())
+                                or tn in ancestor_chain.get(sn, ())
+                            )
+                            if is_pc:
+                                global_suggestions[t_path][row_label].append(
+                                    (tgt_key_label, "x")
+                                )
+                                processed_pairs.add(
+                                    (t_path, row_label, tgt_key_label, char)
+                                )
+                                shortcut_processed_count += 1
+                                logger.info(
+                                    f"Shortcut: Resolved {row_label} -> {tgt_key_label}: 'x' (Parent-Child relation)"
+                                )
+                                if sn not in edges:
+                                    edges[sn] = {}
+                                edges[sn][tn] = "x"
+                                continue
+
+                            # Check Algorithmic Phase 2 (Directories)
+                            if is_dir_map.get(
+                                sn, os.path.isdir(src_path)
+                            ) or is_dir_map.get(tn, os.path.isdir(tgt_path)):
+                                s_children_tuple = file_descendants_by_dir.get(sn)
+                                s_children = (
+                                    list(s_children_tuple)
+                                    if s_children_tuple is not None
+                                    else (
+                                        [sn]
+                                        if not is_dir_map.get(
+                                            sn, os.path.isdir(src_path)
+                                        )
+                                        else []
+                                    )
+                                )
+                                t_children_tuple = file_descendants_by_dir.get(tn)
+                                t_children = (
+                                    list(t_children_tuple)
+                                    if t_children_tuple is not None
+                                    else (
+                                        [tn]
+                                        if not is_dir_map.get(
+                                            tn, os.path.isdir(tgt_path)
+                                        )
+                                        else []
+                                    )
+                                )
+
+                                best_char: str = " "
+                                best_prio: int = -1
+                                found_chars: Set[str] = set()
+
+                                s_set = set(s_children)
+                                t_set = set(t_children)
+                                relevant_sources = s_set.intersection(edges.keys())
+
+                                for sc in relevant_sources:
+                                    sc_edges = edges[sc]
+                                    relevant_targets = t_set.intersection(
+                                        sc_edges.keys()
+                                    )
+                                    for tc in relevant_targets:
+                                        echar = sc_edges[tc]
+                                        if echar:
+                                            prio = get_prio(echar)
+                                            found_chars.add(echar)
+                                            if prio > best_prio:
+                                                best_prio = prio
+                                                best_char = echar
+
+                                if best_prio > -1:
+                                    if {"<", ">"} <= found_chars:
+                                        best_char = "x"
+                                    if best_char in ("p", "S", "s"):
+                                        # Not ready to resolve. Skip, but mark as processed so it's not checked again in this run
+                                        processed_pairs.add(
+                                            (t_path, row_label, tgt_key_label, char)
+                                        )
+                                        continue
+
+                                    global_suggestions[t_path][row_label].append(
+                                        (tgt_key_label, best_char)
+                                    )
+                                    logger.info(
+                                        f"Algorithmically resolved {row_label} -> {tgt_key_label}: '{best_char}' (Rolled up)"
+                                    )
+                                    if sn not in edges:
+                                        edges[sn] = {}
+                                    edges[sn][tn] = best_char
+                                else:
+                                    global_suggestions[t_path][row_label].append(
+                                        (tgt_key_label, "n")
+                                    )
+                                    logger.info(
+                                        f"Algorithmically resolved {row_label} -> {tgt_key_label}: 'n' (No dependencies found)"
+                                    )
+                                    if sn not in edges:
+                                        edges[sn] = {}
+                                    edges[sn][tn] = "n"
+
+                                processed_pairs.add(
+                                    (t_path, row_label, tgt_key_label, char)
+                                )
+                                algo_processed_count += 1
+                                continue
+            except Exception:
+                continue
+
+    # Apply all algorithmic/shortcut suggestions globally
+    if global_suggestions:
+        print(
+            f"\n--- Resolving {algo_processed_count} directory placeholders and {shortcut_processed_count} shortcuts algorithmically ---"
+        )
+        algo_start_time = time.time()
+
+        global_collector = TrackerBatchCollector()
+        for t_path, suggestions in global_suggestions.items():
+            t_type = (
+                "mini"
+                if t_path.endswith("_module.md")
+                else ("doc" if "doc_tracker.md" in os.path.basename(t_path) else "main")
+            )
+
+            # Use cast to ensure type checker knows suggestions is Dict[str, List[Tuple[str, str]]]
+            cast_suggestions: Dict[str, List[Tuple[str, str]]] = dict(suggestions)
+            update_data = update_tracker(
+                output_file_suggestion=t_path,
+                path_to_key_info=global_map,
+                tracker_type=t_type,
+                suggestions_external=cast_suggestions,
+                return_update=True,
+                force_apply_suggestions=True,
+                apply_ast_overrides=False,
+                path_migration_info=path_migration_info,
+            )
+            if not update_data:
+                continue
+
+            out_path = update_data.get("output_file", t_path)
+            t_update = None
+            if t_type == "mini":
+                t_update = create_mini_tracker_update(
+                    output_file=out_path,
+                    key_info_list=update_data["key_info_list"],
+                    grid_rows=update_data["grid_rows"],
+                    last_key_edit=update_data["last_key_edit"],
+                    last_grid_edit=update_data["last_grid_edit"],
+                    module_path=update_data.get("module_path", ""),
+                    path_to_key_info=update_data.get("path_to_key_info", global_map),
+                    existing_lines=update_data.get("existing_lines", []),
+                    tracker_exists=update_data.get("tracker_exists", False),
+                    ast_overrides_applied_count=update_data.get(
+                        "ast_overrides_applied_count", 0
+                    ),
+                    suggestion_applied_count=update_data.get(
+                        "suggestion_applied_count", 0
+                    ),
+                    structural_deps_applied_count=update_data.get(
+                        "structural_deps_applied_count", 0
+                    ),
+                    force_apply_suggestions=True,
+                )
+            elif t_type == "doc":
+                t_update = create_doc_tracker_update(
+                    output_file=out_path,
+                    key_info_list=update_data["key_info_list"],
+                    grid_rows=update_data["grid_rows"],
+                    last_key_edit=update_data["last_key_edit"],
+                    last_grid_edit=update_data["last_grid_edit"],
+                    path_to_key_info=update_data.get("path_to_key_info", global_map),
+                    ast_overrides_applied_count=update_data.get(
+                        "ast_overrides_applied_count", 0
+                    ),
+                    suggestion_applied_count=update_data.get(
+                        "suggestion_applied_count", 0
+                    ),
+                    structural_deps_applied_count=update_data.get(
+                        "structural_deps_applied_count", 0
+                    ),
+                    force_apply_suggestions=True,
+                )
+            else:
+                t_update = create_main_tracker_update(
+                    output_file=out_path,
+                    key_info_list=update_data["key_info_list"],
+                    grid_rows=update_data["grid_rows"],
+                    last_key_edit=update_data["last_key_edit"],
+                    last_grid_edit=update_data["last_grid_edit"],
+                    path_to_key_info=update_data.get("path_to_key_info", global_map),
+                    ast_overrides_applied_count=update_data.get(
+                        "ast_overrides_applied_count", 0
+                    ),
+                    suggestion_applied_count=update_data.get(
+                        "suggestion_applied_count", 0
+                    ),
+                    structural_deps_applied_count=update_data.get(
+                        "structural_deps_applied_count", 0
+                    ),
+                    force_apply_suggestions=True,
+                )
+
+            if t_update:
+                global_collector.add(t_update)
+
+        # Commit all algorithmic updates at once, passing accumulated_updates
+        global_collector.commit_all(
+            skip_populate_hook=True,
+            accumulated_updates=cast(
+                List[Any], getattr(args, "accumulated_tracker_updates", [])
+            ),
+        )
+        logger.info(
+            f"Global Algorithmic/Shortcut phase complete in {time.time()-algo_start_time:.2f}s"
+        )
+
+    # ---------------------------------------------------------
+    # PHASE 3: LLM Resolution (Per-Tracker)
+    # ---------------------------------------------------------
+    selected_tracker: Optional[str] = None
+    llm_tasks: List[Tuple[str, str, str, str]] = []
+    tracker_type = ""
+
+    for t_path in trackers_to_scan:
+        if not os.path.isfile(t_path):
+            continue
+
+        t_type = (
+            "mini"
+            if t_path.endswith("_module.md")
+            else ("doc" if "doc_tracker.md" in os.path.basename(t_path) else "main")
+        )
+        try:
+            with open(t_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            key_def_pairs = read_key_definitions_from_lines(lines)
+            _, grid_rows_data = read_grid_from_lines(lines)
+        except Exception:
+            continue
+
+        if not key_def_pairs or not grid_rows_data:
+            continue
+
+        found_llm_tasks: List[Tuple[str, str, str, str]] = []
+        for row_idx, (row_label, compressed_row) in enumerate(grid_rows_data):
+            if focus_key and row_label != focus_key:
+                continue
+            if row_idx >= len(key_def_pairs):
+                continue
+
+            _, src_path = key_def_pairs[row_idx]
+            if not src_path or not os.path.exists(src_path):
+                continue
+
+            try:
+                decomp = list(decompress(compressed_row))
+                for col_idx, char in enumerate(decomp):
+                    if char in dep_chars and col_idx < len(key_def_pairs):
+                        tgt_key_label, tgt_path = key_def_pairs[col_idx]
+                        if tgt_path and os.path.exists(tgt_path):
+                            if (
+                                t_path,
+                                row_label,
+                                tgt_key_label,
+                                char,
+                            ) in processed_pairs:
+                                continue
+
+                            sn = normalize_path(src_path)
+                            tn = normalize_path(tgt_path)
+                            if is_dir_map.get(
+                                sn, os.path.isdir(src_path)
+                            ) or is_dir_map.get(tn, os.path.isdir(tgt_path)):
+                                # This is a directory placeholder that wasn't resolved in Phase 2
+                                # Do NOT send it to the LLM.
+                                processed_pairs.add(
+                                    (t_path, row_label, tgt_key_label, char)
+                                )
+                                continue
+
+                            found_llm_tasks.append(
+                                (row_label, src_path, tgt_key_label, tgt_path)
+                            )
+            except Exception:
+                continue
+
+        if found_llm_tasks:
+            selected_tracker = t_path
+            llm_tasks = found_llm_tasks
+            tracker_type = t_type
+            break
+
+    if not selected_tracker or not llm_tasks:
+        print("Finished resolving. No LLM tasks required.")
+        return 0
+
+    dep_chars_str = "', '".join(dep_chars)
+    print(
+        f"Automatically selected tracker: {selected_tracker} (scanning for: '{dep_chars_str}')"
+    )
+    print(f"Found {len(llm_tasks)} unresolved dependencies for ('{dep_chars_str}').")
+
+    llm_tasks = llm_tasks[:limit]
+
+    MAX_MODEL_TOKENS = 30000  # Leave buffer for system prompt (total ctx 32768)
+    WRAPPER_OVERHEAD = 1000  # Approximate system prompt + overhead
+
+    token_map = _load_token_metadata(get_project_root())
+    symbol_map = load_project_symbol_map()
+
+    from cline_utils.dependency_system.utils.placeholder_resolver import (
+        PlaceholderResolver,
+    )
+
+    # --- Initialize processor first so its tokenizer is available for exact counting ---
+    processor = LocalLLMProcessor(model_path=model_path)
+
+    # --- Eager preparation: read files + SES substitution for every pair ---
+    print(f"Preparing {len(llm_tasks)} pairs and measuring exact token requirements...")
+    all_prepared: List[PreparedPair] = [
+        _prepare_pair(
+            sk, sp, tk, tp, symbol_map, token_map, MAX_MODEL_TOKENS, WRAPPER_OVERHEAD
+        )
+        for sk, sp, tk, tp in llm_tasks
+    ]
+
+    # Partition: pairs that exceed the token limit are already flagged skip=True by _prepare_pair
+    valid_prepared = [p for p in all_prepared if not p.skip]
+    skipped_prepared = [p for p in all_prepared if p.skip]
+
+    if skipped_prepared:
+        print(f"  {len(skipped_prepared)} pair(s) skipped (exceed token limit).")
+
+    # --- Exact token measurement: count src+tgt content tokens for each valid pair ---
+    # The instruction wrapper is constant across all pairs, so counting content tokens
+    # gives an exact proportional ordering.  We use the processor's own tokenizer so
+    # the counts reflect the actual model vocabulary — no heuristics involved.
+    print(f"  Counting exact tokens for {len(valid_prepared)} pair(s)...")
+    for prep in valid_prepared:
+        exact = processor.get_token_count(prep.srccontent + prep.tgtcontent)
+        # Store the exact count back into the PreparedPair fields for the sort key.
+        # stokens + ttokens are used as a hint by determine_dependency but not for
+        # correctness — overwriting them with the exact combined count is safe here.
+        prep.stokens = exact
+        prep.ttokens = 0  # absorbed into stokens; ttokens is now redundant
+
+    # --- Deterministic sort: largest context first so n_ctx only ever shrinks ---
+    valid_prepared.sort(key=lambda p: p.stokens, reverse=True)
+    print(
+        f"Processing batch of {len(valid_prepared)} items (sorted by descending exact token count)..."
+    )
+
+    # Re-mark processed_pairs to include all tasks (valid + skipped) before GPU work begins
+    for prep in all_prepared:
+        processed_pairs.add((selected_tracker, prep.srckey, prep.tgtkey, dep_chars[0]))
+
+    resolver = PlaceholderResolver(processor)
+
+    # Identity wrapper: pairs are already prepared; no I/O needed inside resolve_batch
+    prepared_index: Dict[Tuple[str, str], PreparedPair] = {
+        (p.srckey, p.tgtkey): p for p in valid_prepared
+    }
+
+    def _identity_prepare(sk: str, sp: str, tk: str, tp: str) -> PreparedPair:
+        return prepared_index.get(
+            (sk, tk),
+            _prepare_pair(
+                sk,
+                sp,
+                tk,
+                tp,
+                symbol_map,
+                token_map,
+                MAX_MODEL_TOKENS,
+                WRAPPER_OVERHEAD,
+            ),
+        )
+
+    # Pass valid_prepared as (srckey, srcpath, tgtkey, tgtpath) tuples
+    sorted_tasks = [(p.srckey, p.srcpath, p.tgtkey, p.tgtpath) for p in valid_prepared]
+
+    total_processed = resolver.resolve_batch(
+        tasks=sorted_tasks,
+        tracker_path=selected_tracker,
+        global_map=global_map,
+        tracker_type=tracker_type,
+        prepare_func=_identity_prepare,
+        accumulated_updates=cast(
+            List[Any], getattr(args, "accumulated_tracker_updates", [])
+        ),
+        path_migration_info=path_migration_info,
+    )
+
+    args.limit -= total_processed
+    if args.limit > 0 and total_processed > 0 and args.tracker is None:
+        print(f"Continuing to next tracker. Remaining limit: {args.limit}")
+        processor.close()
+        return handle_resolve_placeholders(args)
+
+    processor.close()
+    return 0
+
+
+def handle_reconcile_transparency(args: argparse.Namespace) -> int:
+    """
+    Scans files for documentation markers and reconciles them with the transparency registry.
+    """
+    from cline_utils.dependency_system.io.transparency_manager import (
+        get_transparency_manager,
+    )
+
+    manager = get_transparency_manager()
+    project_root = get_project_root()
+    config = ConfigManager()
+    excluded_paths = config.get_excluded_paths()
+
+    # Identify files to scan
+    all_files: List[str] = []
+    scan_path = args.path if args.path else project_root
+
+    if os.path.isfile(scan_path):
+        all_files.append(scan_path)
+    elif os.path.isdir(scan_path):
+        for root, dirs, files in os.walk(scan_path):
+            # Skip common hidden/build dirs
+            dirs[:] = [
+                d
+                for d in dirs
+                if not d.startswith(".")
+                and d not in ("node_modules", "venv", "__pycache__")
+                and normalize_path(os.path.join(root, d)) not in excluded_paths
+            ]
+            for f in files:
+                file_path = normalize_path(os.path.join(root, f))
+                if file_path in excluded_paths:
+                    continue
+                if f.endswith((".md", ".txt", ".rst")):
+                    all_files.append(file_path)
+
+    # Secondary filter for absolute paths
+    all_files = [f for f in all_files if normalize_path(f) not in excluded_paths]
+
+    if not all_files:
+        logger.debug(f"No documentation files found to scan in {scan_path}.")
+        return 0
+
+    reconciled_count = 0
+    with manager._update_context():
+        for file_path in all_files:
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+
+                # Find markers and calculate shifts
+                sections: Dict[str, Tuple[int, int]] = {}
+                for i, line in enumerate(lines):
+                    stripped = line.strip()
+                    if stripped.startswith("---") and stripped.endswith("_START---"):
+                        section_name = stripped[3:-9]
+                        # Find end
+                        for j in range(i + 1, len(lines)):
+                            if lines[j].strip() == f"---{section_name}_END---":
+                                sections[section_name] = (i, j)
+                                break
+
+                # Dispatch based on transform
+                if args.transform == "restore":
+                    if manager.restore_markers(file_path):
+                        logger.info(
+                            f"  [RESTORED] {os.path.relpath(file_path, project_root)}: Markers re-inserted from registry."
+                        )
+                        reconciled_count += 1
+                    else:
+                        logger.debug(
+                            f"  [SKIP RESTORE] {os.path.relpath(file_path, project_root)}: No registry data or already tagged."
+                        )
+                    continue
+
+                if args.transform == "remove":
+                    if manager.remove_markers(file_path):
+                        logger.info(
+                            f"  [REMOVED MARKERS] {os.path.relpath(file_path, project_root)}: Markers moved to registry."
+                        )
+                        reconciled_count += 1
+                    else:
+                        logger.debug(
+                            f"  [SKIP REMOVE] {os.path.relpath(file_path, project_root)}: No markers found or already removed."
+                        )
+                    continue
+
+                # For other transforms (html, register), we need to find existing markers
+                if not sections:
+                    continue
+
+                if args.transform == "html":
+                    # Convert to HTML comments
+                    new_lines = list(lines)
+                    for name, (start_idx, end_idx) in sections.items():
+                        new_lines[start_idx] = f"<!-- ---{name}_START--- -->\n"
+                        new_lines[end_idx] = f"<!-- ---{name}_END--- -->\n"
+
+                    content = "".join(new_lines)
+                    # Register with markers present (but commented out)
+                    registry_sections: Dict[str, Any] = {
+                        name: (start_idx + 1, end_idx + 1)
+                        for name, (start_idx, end_idx) in sections.items()
+                    }
+                    manager.update_file_metadata(file_path, registry_sections, content)
+
+                    with open(file_path, "w", encoding="utf-8") as f:
+                        f.write(content)
+
+                    logger.info(
+                        f"  [HTML COMMENTS] {os.path.relpath(file_path, project_root)}: {len(sections)} sections registered."
+                    )
+
+                else:
+                    # Just register with current markers
+                    content = "".join(lines)
+                    registry_sections: Dict[str, Any] = {
+                        name: (start_idx + 1, end_idx + 1)
+                        for name, (start_idx, end_idx) in sections.items()
+                    }
+                    manager.update_file_metadata(file_path, registry_sections, content)
+                    logger.info(
+                        f"  [REGISTERED] {os.path.relpath(file_path, project_root)}: {len(sections)} sections found."
+                    )
+
+                reconciled_count += 1
+
+            except Exception as e:
+                print(f"  Error processing {file_path}: {e}")
+                logger.error(
+                    f"Reconciliation error for {file_path}: {e}", exc_info=True
+                )
+
+    print(f"\nSuccessfully reconciled transparency for {reconciled_count} files.")
+    return 0
+
+
+def handle_normalize_docs(args: argparse.Namespace) -> int:
+    """
+    Two-step documentation workflow:
+    1. Scan candidates and query local LLM to normalize docs with physical compliance markers.
+    2. If not dry-run, immediately run transparency virtualization to relocate markers/metadata
+       to transparency_registry.json, leaving the physical file completely clean.
+    """
+    from cline_utils.dependency_system.io.normalize_docs import (
+        normalize_docs_batch,
+        load_transparency_registry,
+        find_normalization_candidates,
+    )
+    from cline_utils.dependency_system.analysis.local_llm_processor import (
+        LocalLLMProcessor,
+    )
+    from cline_utils.dependency_system.utils.config_manager import ConfigManager
+
+    project_root = get_project_root()
+    config_mgr = ConfigManager()
+
+    # Get doc directories dynamically
+    doc_dirs = config_mgr.get_doc_directories()
+    logger.info(f"Resolved doc directories from default-rules.md: {doc_dirs}")
+
+    registered_files = load_transparency_registry(project_root)
+    logger.info(
+        f"Loaded {len(registered_files)} registered files from transparency registry."
+    )
+
+    # Find candidate files
+    try:
+        candidates = find_normalization_candidates(
+            project_root=project_root,
+            doc_dirs=doc_dirs,
+            registered_files=registered_files,
+            file_path_arg=args.file,
+        )
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        return 1
+
+    total_candidates = len(candidates)
+    logger.info(
+        f"Found {total_candidates} candidate files that need normalization or placeholder resolution."
+    )
+
+    if total_candidates == 0:
+        print("All files are fully compliant and resolved!")
+        return 0
+
+    # Initialize Local LLM
+    model_path = (
+        args.model
+        if args.model
+        else os.path.join(project_root, "models", "Qwen3-4B-Instruct-2507-Q8_0.gguf")
+    )
+    if not os.path.exists(model_path):
+        print(f"Error: Local LLM model not found at {model_path}")
+        return 1
+
+    logger.info(f"Initializing local LLM from {model_path}...")
+    processor = LocalLLMProcessor(model_path=model_path)
+
+    # Use the reusable batch normalization function
+    normalize_docs_batch(
+        candidates=candidates,
+        processor=processor,
+        project_root=project_root,
+        limit=args.limit,
+        dry_run=args.dry_run,
+    )
+
+    processor.close()
+    return 0
+
+
 def main():
     """Parse arguments and dispatch to handlers."""
+    _configure_stdio_for_unicode()
     parser = argparse.ArgumentParser(description="Dependency tracking system CLI")
     subparsers = parser.add_subparsers(
         dest="command", help="Available commands", required=True
@@ -1716,6 +2969,30 @@ def main():
     )
     analyze_project_parser.set_defaults(func=command_handler_analyze_project)
 
+    # --- Context Packager Commands ---
+    build_context_parser = subparsers.add_parser(
+        "build-context",
+        help="Build a token-optimized context package for an LLM task centering around target keys.",
+    )
+    build_context_parser.add_argument(
+        "--keys",
+        required=True,
+        help="Comma-separated list of target keymaps (e.g. 1A1,2B4)",
+    )
+    build_context_parser.add_argument(
+        "--max-tokens", type=int, help="Maximum token budget for the context package."
+    )
+    build_context_parser.add_argument(
+        "--mode",
+        choices=["auto", "local", "cloud"],
+        default="auto",
+        help="Routing mode to enforce token safety ceilings (local, cloud, auto).",
+    )
+    build_context_parser.add_argument(
+        "--output", help="Path to save the generated context Markdown file."
+    )
+    build_context_parser.set_defaults(func=handle_build_context)
+
     # --- Grid Manipulation Commands ---
     compress_parser = subparsers.add_parser("compress", help="Compress RLE string")
     compress_parser.add_argument("string", help="String to compress")
@@ -1733,24 +3010,6 @@ def main():
     get_char_parser.add_argument("string", help="Compressed string")
     get_char_parser.add_argument("index", type=int, help="Logical index")
     get_char_parser.set_defaults(func=handle_get_char)
-
-    set_char_parser = subparsers.add_parser(
-        "set_char",
-        help="DEPRECATED & UNSAFE: Set char in a tracker file. Use 'add-dependency' instead.",
-    )
-    set_char_parser.add_argument("tracker_file", help="Path to tracker file")
-    set_char_parser.add_argument(
-        "key",
-        type=str,
-        help="Row key label from tracker definitions (e.g., '1A1' or '1A1#2')",
-    )
-    set_char_parser.add_argument(
-        "index",
-        type=int,
-        help="Logical index in row (0-based, refers to Nth definition in tracker's original order)",
-    )
-    set_char_parser.add_argument("char", type=str, help="New character")
-    set_char_parser.set_defaults(func=handle_set_char)
 
     add_dep_parser = subparsers.add_parser(
         "add-dependency",
@@ -1850,10 +3109,12 @@ def main():
     # --- Show Placeholders Command (ENHANCED) ---
     show_placeholders_parser = subparsers.add_parser(
         "show-placeholders",
-        help="Show unverified dependencies ('p', 's', 'S') in a tracker",
+        help="Show unverified dependencies ('p', 's', 'S') in a tracker. Without --tracker, shows summary across all trackers.",
     )
     show_placeholders_parser.add_argument(
-        "--tracker", required=True, help="Path to the tracker file (.md)"
+        "--tracker",
+        required=False,
+        help="Path to the tracker file (.md). If omitted, shows aggregate summary across all trackers from tracker_map.json.",
     )
     show_placeholders_parser.add_argument(
         "--key",
@@ -1878,9 +3139,22 @@ def main():
     )
     visualize_parser.add_argument(
         "--format",
-        choices=["mermaid"],
+        choices=["mermaid", "svg"],
         default="mermaid",
-        help="Output format (only mermaid currently)",
+        help="Output format. Use 'svg' for the native renderer.",
+    )
+    visualize_parser.add_argument(
+        "--backend",
+        choices=["mermaid", "native", "isometric", "threejs"],
+        default=None,
+        help="Rendering backend. Defaults to native when --format svg is used.",
+    )
+    visualize_parser.add_argument(
+        "--render-stage",
+        type=int,
+        choices=[1, 2, 3, 4, 5],
+        default=None,
+        help="Native render stage. For isometric: 1 islands, 2 pipes, 3 local stubs.",
     )
     visualize_parser.add_argument(
         "--output",
@@ -1888,6 +3162,81 @@ def main():
         help="Output file path (default: project_overview... or focus_KEY(s)...)",
     )
     visualize_parser.set_defaults(func=handle_visualize_dependencies)
+
+    # --- Resolve Placeholders Command (Batch LLM) ---
+    resolve_placeholders_parser = subparsers.add_parser(
+        "resolve-placeholders",
+        help="Resolve unverified 'p' dependencies using Local LLM in batches",
+    )
+    resolve_placeholders_parser.add_argument(
+        "--tracker",
+        required=False,
+        help="Path to the tracker file (optional, uses tracker_map.json by default)",
+    )
+    resolve_placeholders_parser.add_argument(
+        "--key", required=False, help="Restricts to dependencies of this source key"
+    )
+    resolve_placeholders_parser.add_argument(
+        "--limit",
+        type=int,
+        default=200,
+        help="Max dependencies to process (default: 200)",
+    )
+    resolve_placeholders_parser.add_argument(
+        "--dep-char", default="p", help="Dependency char to resolve (default: p)"
+    )
+    resolve_placeholders_parser.add_argument(
+        "--model", required=False, help="Path to GGUF model"
+    )
+    resolve_placeholders_parser.set_defaults(func=handle_resolve_placeholders)
+
+    # --- Determine Dependency Command (LOCAL LLM) ---
+    determine_dep_parser = subparsers.add_parser(
+        "determine-dependency",
+        help="Use local LLM to determine dependency between two keys",
+    )
+    determine_dep_parser.add_argument(
+        "--source-key", required=True, help="Source key (e.g., '1A1' or '1A1#2')"
+    )
+    determine_dep_parser.add_argument(
+        "--target-key", required=True, help="Target key (e.g., '2Ba2' or '2Ba2#1')"
+    )
+    determine_dep_parser.add_argument(
+        "--model", required=False, help="Optional: Path to the GGUF model"
+    )
+    determine_dep_parser.set_defaults(func=handle_determine_dependency)
+
+    # --- Reconcile Transparency Command ---
+    reconcile_parser = subparsers.add_parser(
+        "reconcile-transparency",
+        help="Reconcile documentation markers with the transparency registry",
+    )
+    reconcile_parser.add_argument(
+        "--path", help="Path to file or directory to scan (default: project root)"
+    )
+    reconcile_parser.add_argument(
+        "--transform",
+        choices=["html", "remove", "restore"],
+        help="Transform markers: 'html' (convert to comments), 'remove' (delete), or 'restore' (re-insert)",
+    )
+    reconcile_parser.set_defaults(func=handle_reconcile_transparency)
+
+    # --- Normalize Docs Command ---
+    normalize_docs_parser = subparsers.add_parser(
+        "normalize-docs",
+        help="Normalize documentation files and relocate markers to transparency registry",
+    )
+    normalize_docs_parser.add_argument("--file", type=str, help="Process a single file")
+    normalize_docs_parser.add_argument(
+        "--limit", type=int, default=10, help="Max files to process"
+    )
+    normalize_docs_parser.add_argument(
+        "--dry-run", action="store_true", help="Dry run mode"
+    )
+    normalize_docs_parser.add_argument(
+        "--model", required=False, help="Path to GGUF model"
+    )
+    normalize_docs_parser.set_defaults(func=handle_normalize_docs)
 
     args = parser.parse_args()
 
@@ -1900,7 +3249,9 @@ def main():
     log_file_path: Optional[str] = None
     try:
         log_file_path = normalize_path(os.path.join(get_project_root(), "debug.txt"))
-        file_handler = logging.FileHandler(log_file_path, mode="w")
+        file_handler = logging.FileHandler(
+            log_file_path, mode="w", encoding="utf-8", errors="backslashreplace"
+        )
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(log_formatter)
         root_logger.addHandler(file_handler)
@@ -1921,7 +3272,12 @@ def main():
         suggestions_log_path = normalize_path(
             os.path.join(get_project_root(), "suggestions.log")
         )
-        suggestion_handler = logging.FileHandler(suggestions_log_path, mode="w")
+        suggestion_handler = logging.FileHandler(
+            suggestions_log_path,
+            mode="w",
+            encoding="utf-8",
+            errors="backslashreplace",
+        )
         suggestion_handler.setLevel(logging.DEBUG)
         suggestion_handler.setFormatter(log_formatter)
 
@@ -1964,6 +3320,79 @@ def main():
     # Execute command
     if hasattr(args, "func"):
         exit_code = args.func(args)
+
+        # If it was resolve-placeholders, run the hook at the end
+        if args.func == handle_resolve_placeholders and hasattr(
+            args, "accumulated_tracker_updates"
+        ):
+            if args.accumulated_tracker_updates:
+                from cline_utils.dependency_system.utils.populate_comments import (
+                    populate_comments_for_batch,
+                    report_batch_results,
+                )
+                from cline_utils.dependency_system.io.transparency_manager import (
+                    get_transparency_manager,
+                )
+                from cline_utils.dependency_system.analysis.dependency_suggester import (
+                    load_project_symbol_map,
+                )
+                from cline_utils.dependency_system.utils.cache_manager import (
+                    get_project_root_cached,
+                )
+                from pathlib import Path
+
+                print(
+                    f"Running final populate_comments_hook for {len(args.accumulated_tracker_updates)} accumulated updates..."
+                )
+                try:
+                    results = populate_comments_for_batch(
+                        project_root=Path(get_project_root_cached()),
+                        updates=args.accumulated_tracker_updates,
+                        symbol_map=load_project_symbol_map(),
+                        dry_run=False,
+                        verbose=False,
+                    )
+                    if results:
+                        report_batch_results(results, dry_run=False)
+                        manager = get_transparency_manager()
+                        files_processed: Set[str] = set()
+                        files_with_maps: Set[str] = set()
+                        paths_to_virtualize: List[str] = []
+                        for result in results:
+                            if result:
+                                path = result.get("path")
+                                if isinstance(path, str):
+                                    files_processed.add(path)
+                                    maps_added = result.get("maps_added")
+                                    maps_updated = result.get("maps_updated")
+                                    maps_count = (
+                                        maps_added if isinstance(maps_added, int) else 0
+                                    ) + (
+                                        maps_updated
+                                        if isinstance(maps_updated, int)
+                                        else 0
+                                    )
+                                    if maps_count > 0:
+                                        files_with_maps.add(path)
+                                        paths_to_virtualize.append(path)
+                        virtualized = 0
+                        if paths_to_virtualize:
+                            virtualized = manager.bulk_virtualize_connection_maps(
+                                paths_to_virtualize, clear_if_absent=False
+                            )
+                        if files_processed:
+                            manager.bulk_prune_stale_virtual_maps(
+                                files_processed, files_with_maps
+                            )
+                        if virtualized:
+                            logger.info(
+                                "Virtualized CONNECTION_MAP comments for "
+                                f"{virtualized} populated file(s)"
+                            )
+                except Exception as e:
+                    logger.error(f"Error in final populate_comments hook: {e}")
+                args.accumulated_tracker_updates.clear()
+
         sys.exit(exit_code)
     else:
         parser.print_help()

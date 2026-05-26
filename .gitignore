@@ -2,3 +2,9 @@
 *.pyc
 *venv*
 *embeddings*
+.kilocodemodes
+docs/**
+.comment_backup/
+.agent/**
+.clinerules.config.json
+debug_llm_repair.log

@@ -6,22 +6,25 @@ import logging
 import os
 import re
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, cast
 
 from cline_utils.dependency_system.core.dependency_grid import (
     DIAGONAL_CHAR,
     EMPTY_CHAR,
     decompress,
 )
-from cline_utils.dependency_system.core.key_manager import KeyInfo, validate_key
+from cline_utils.dependency_system.core.key_manager import (
+    KeyInfo,
+    load_tracker_map,
+    validate_key,
+)
 
 from .cache_manager import cached
+from .cache_manager import normalize_path_cached as normalize_path
 from .config_manager import ConfigManager
-from .path_utils import normalize_path
+from .path_utils import PathMigrationInfo
 
 logger = logging.getLogger(__name__)
-
-PathMigrationInfo = Dict[str, Tuple[Optional[str], Optional[str]]]
 
 
 # --- GLOBAL INSTANCE RESOLUTION HELPERS (Centralized Here) ---
@@ -201,11 +204,21 @@ def read_grid_from_lines(lines: List[str]) -> Tuple[List[str], List[Tuple[str, s
 # --- END OF PARSING HELPERS ---
 
 
+def _get_tracker_structured_cache_key(
+    tracker_path: str, include_raw_lines: bool = False
+) -> str:
+    mtime = os.path.getmtime(tracker_path) if os.path.exists(tracker_path) else 0
+    return f"tracker_data_structured:{normalize_path(tracker_path)}:{mtime}:raw={include_raw_lines}"
+
+
 @cached(
     "tracker_data_structured",
-    key_func=lambda tracker_path: f"tracker_data_structured:{normalize_path(tracker_path)}:{(os.path.getmtime(tracker_path) if os.path.exists(tracker_path) else 0)}",
+    key_func=_get_tracker_structured_cache_key,
+    track_path_args=[0],
 )
-def read_tracker_file_structured(tracker_path: str) -> Dict[str, Any]:
+def read_tracker_file_structured(
+    tracker_path: str, include_raw_lines: bool = False
+) -> Dict[str, Any]:
     """
     Read a tracker file and parse its contents into list-based structures
     compatible with the new format (handles duplicate key strings).
@@ -220,12 +233,13 @@ def read_tracker_file_structured(tracker_path: str) -> Dict[str, Any]:
     """
     tracker_path = normalize_path(tracker_path)
     # Initialize with empty lists for the new structure
-    empty_result = {
+    empty_result: Dict[str, Any] = {
         "definitions_ordered": [],
         "grid_headers_ordered": [],
         "grid_rows_ordered": [],
-        "last_key_edit": "",
-        "last_grid_edit": "",
+        "last_key_edit": "Unknown",
+        "last_grid_edit": "Unknown",
+        "raw_lines": [] if include_raw_lines else None,
     }
     if not os.path.exists(tracker_path):
         logger.debug(
@@ -273,10 +287,10 @@ def read_tracker_file_structured(tracker_path: str) -> Dict[str, Any]:
             )
             grid_headers = [d[0] for d in definitions]
 
-        logger.debug(
-            f"Read structured tracker '{os.path.basename(tracker_path)}': "
-            f"{len(definitions)} defs, {len(grid_headers)} grid headers, {len(grid_rows)} grid rows."
-        )
+        # logger.debug(
+        #     f"Read structured tracker '{os.path.basename(tracker_path)}': "
+        #     f"{len(definitions)} defs, {len(grid_headers)} grid headers, {len(grid_rows)} grid rows."
+        # )
 
         return {
             "definitions_ordered": definitions,
@@ -284,15 +298,27 @@ def read_tracker_file_structured(tracker_path: str) -> Dict[str, Any]:
             "grid_rows_ordered": grid_rows,
             "last_key_edit": last_key_edit,
             "last_grid_edit": last_grid_edit,
+            "raw_lines": lines if include_raw_lines else None,
         }
     except Exception as e:
         logger.exception(f"Error reading structured tracker file {tracker_path}: {e}")
         return empty_result
 
 
-def find_all_tracker_paths(config: ConfigManager, project_root: str) -> Set[str]:
+def find_all_tracker_paths(
+    config: ConfigManager, project_root: str, force_scan: bool = False
+) -> Set[str]:
     """Finds all main, doc, and mini tracker files in the project."""
-    all_tracker_paths = set()
+    if not force_scan:
+        cached_paths = load_tracker_map()
+        if cached_paths:
+            # Return only those that still exist on disk
+            existing_cached = {p for p in cached_paths if os.path.exists(p)}
+            if existing_cached:
+                # logger.debug(f"Using {len(existing_cached)} tracker paths from persistent map.")
+                return existing_cached
+
+    all_tracker_paths: Set[str] = set()
     memory_dir_rel = config.get_path("memory_dir")
     if not memory_dir_rel:
         logger.warning("memory_dir not configured. Cannot find main/doc trackers.")
@@ -308,9 +334,9 @@ def find_all_tracker_paths(config: ConfigManager, project_root: str) -> Set[str]
             "main_tracker_filename",
             os.path.join(memory_dir_abs, "module_relationship_tracker.md"),
         )
-        logger.debug(
-            f"Using main_tracker_abs from config (or default): '{main_tracker_abs}'"
-        )
+        # logger.debug(
+        #     f"Using main_tracker_abs from config (or default): '{main_tracker_abs}'"
+        # )
         if os.path.exists(main_tracker_abs):
             all_tracker_paths.add(main_tracker_abs)
         else:
@@ -320,9 +346,9 @@ def find_all_tracker_paths(config: ConfigManager, project_root: str) -> Set[str]
         doc_tracker_abs = config.get_path(
             "doc_tracker_filename", os.path.join(memory_dir_abs, "doc_tracker.md")
         )
-        logger.debug(
-            f"Using doc_tracker_abs from config (or default): '{doc_tracker_abs}'"
-        )
+        # logger.debug(
+        #     f"Using doc_tracker_abs from config (or default): '{doc_tracker_abs}'"
+        # )
         if os.path.exists(doc_tracker_abs):
             all_tracker_paths.add(doc_tracker_abs)
         else:
@@ -351,7 +377,7 @@ def find_all_tracker_paths(config: ConfigManager, project_root: str) -> Set[str]
                 logger.error(
                     f"Error during glob search for mini trackers under '{code_root_abs}': {e}"
                 )
-    logger.debug(f"Found {len(all_tracker_paths)} total tracker files.")
+    # logger.debug(f"Found {len(all_tracker_paths)} total tracker files.")
     return all_tracker_paths
 
 
@@ -365,11 +391,63 @@ def get_global_map_cache_key_part(global_map: Dict[str, Any]) -> str:
 
 
 # --- MODIFIED AGGREGATION FUNCTION (Uses KEY#global_instance) ---
+runtime_aggregation_cache: Optional[Dict[Tuple[str, str], Tuple[str, Set[str]]]] = None
+
+
+def set_runtime_aggregation_cache(
+    cache: Dict[Tuple[str, str], Tuple[str, Set[str]]],
+) -> None:
+    """Sets a runtime cache to avoid re-aggregating from disk."""
+    global runtime_aggregation_cache
+    runtime_aggregation_cache = cache
+    logger.debug(
+        f"TrackerUtils: Set runtime aggregation cache with {len(cache)} entries."
+    )
+
+
+def clear_runtime_aggregation_cache() -> None:
+    """Clears the runtime aggregation cache."""
+    global runtime_aggregation_cache
+    runtime_aggregation_cache = None
+    logger.debug("TrackerUtils: Cleared runtime aggregation cache.")
+
+
+def _get_aggregation_v2_cache_key(
+    tracker_paths: Set[str],
+    path_migration_info: PathMigrationInfo,
+    current_global_path_to_key_info: Dict[str, KeyInfo],
+    show_progress: bool = True,
+) -> str:
+    paths_part = ":".join(sorted(list(tracker_paths)))
+
+    # Stable hash for PathMigrationInfo instead of builtin hash()
+    if path_migration_info:
+        pmi_str = "".join(
+            f"{k}{v[0]}{v[1]}" for k, v in sorted(path_migration_info.items())
+        )
+        pmi_part = hashlib.sha256(pmi_str.encode()).hexdigest()
+    else:
+        pmi_part = "empty"
+
+    cgptki_part = get_global_map_cache_key_part(current_global_path_to_key_info)
+    return f"agg_v2_gi:{paths_part}:{pmi_part}:{cgptki_part}"
+
+
+def _get_agg_file_deps(
+    tracker_paths: Set[str],
+    path_migration_info: PathMigrationInfo,
+    current_global_path_to_key_info: Dict[str, KeyInfo],
+    show_progress: bool = True,
+) -> List[str]:
+    return list(tracker_paths)
+
+
 @cached(
     "aggregation_v2_gi",
-    # MODIFIED key_func - show_progress doesn't affect cache, so it's accepted but not included in key
-    key_func=lambda paths, pmi, cgptki, show_progress=True: f"agg_v2_gi:{':'.join(sorted(list(paths)))}:{hash(tuple(sorted(pmi.items())))}:{get_global_map_cache_key_part(cgptki)}",
-    ttl=300,
+    key_func=_get_aggregation_v2_cache_key,
+    ttl=2000,
+    file_deps=_get_agg_file_deps,
+    check_mtime=True,
 )
 def aggregate_all_dependencies(
     tracker_paths: Set[str],
@@ -383,6 +461,12 @@ def aggregate_all_dependencies(
     Aggregates dependencies from tracker files, resolving paths to current global KeyInfo objects
     and then to their KEY#global_instance strings for instance-specific aggregation.
     """
+    global runtime_aggregation_cache
+    if runtime_aggregation_cache is not None:
+        logger.debug(
+            f"TrackerUtils: Using runtime aggregation cache ({len(runtime_aggregation_cache)} entries)."
+        )
+        return runtime_aggregation_cache
     aggregated_links: Dict[Tuple[str, str], Tuple[str, Set[str]]] = (
         {}
     )  # Key: (src_KEY#GI, tgt_KEY#GI)
@@ -398,8 +482,8 @@ def aggregate_all_dependencies(
 
     def _aggregate_single_tracker(
         tracker_file_path: str,
-    ) -> Dict[Tuple[str, str], Tuple[str, Set[str]]]:
-        local_links: Dict[Tuple[str, str], Tuple[str, Set[str]]] = {}
+    ) -> Dict[Tuple[str, str], Tuple[Optional[str], Set[str]]]:
+        local_links: Dict[Tuple[str, str], Tuple[Optional[str], Set[str]]] = {}
         logger.debug(
             f"Aggregation: Processing tracker {os.path.basename(tracker_file_path)}"
         )
@@ -499,9 +583,11 @@ def aggregate_all_dependencies(
                         continue
 
                     link = (source_key_gi_str, target_key_gi_str)
-                    existing_char, existing_origins = local_links.get(
-                        link, (None, set())
-                    )
+                    res = local_links.get(link)
+                    if res:
+                        existing_char, existing_origins = res
+                    else:
+                        existing_char, existing_origins = None, cast(Set[str], set())
                     try:
                         current_priority = get_priority_from_char(dep_char_val)
                         existing_priority = (
@@ -544,13 +630,17 @@ def aggregate_all_dependencies(
 
     # Run per-tracker aggregation in parallel
     tracker_list = list(tracker_paths)
-    processor = BatchProcessor(show_progress=show_progress, phase_name="Aggregating Dependencies")
+    processor = BatchProcessor(
+        show_progress=show_progress, phase_name="Aggregating Dependencies"
+    )
     per_tracker_results = processor.process_items(
         tracker_list, _aggregate_single_tracker
     )
 
     # Merge results
     for local_links in per_tracker_results:
+        if local_links is None:
+            continue
         for link, (char_val, origins) in local_links.items():
             # Normalize existing entry types explicitly and ensure we never assign None
             existing_entry = aggregated_links.get(link)
@@ -593,7 +683,5 @@ def aggregate_all_dependencies(
     logger.debug(
         f"Aggregation complete. Found {len(aggregated_links)} unique KEY#global_instance directed links."
     )
+    set_runtime_aggregation_cache(aggregated_links)
     return aggregated_links
-
-
-# --- End of tracker_utils.py ---

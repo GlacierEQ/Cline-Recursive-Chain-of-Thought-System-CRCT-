@@ -5,16 +5,33 @@ Module for managing embeddings generation and similarity calculations using cont
 Handles embedding creation from project files using Symbol Essence Strings (SES) derived from
 the project symbol map, and calculates cosine similarity between embeddings.
 """
+
+import gc
+import hashlib
 import json
 import logging
 import os
+import re
 import sys
+import textwrap
 import threading
-import urllib.request
-from typing import Any, Dict, List, Optional, Tuple
+import urllib.error
+from urllib.request import Request, urlopen
+from typing import Any, Dict, List, Optional, Set, Tuple, Sequence, cast
 
 import numpy as np
+from cline_utils.dependency_system.io.file_io import (
+    read_file_content_safely,
+    strip_auto_generated_blocks,
+)
+from cline_utils.dependency_system.utils.calculate_hash import calculate_content_hash
+from cline_utils.dependency_system.io.transparency_manager import (
+    extract_connection_map_metadata,
+    read_file_transparently,
+)
 import torch
+
+from cline_utils.dependency_system.utils import tokenizer_factory
 
 # from llama_cpp import Llama
 # from transformers import (
@@ -32,21 +49,23 @@ except ImportError:
 import cline_utils.dependency_system.core.key_manager as key_manager_module
 from cline_utils.dependency_system.core.key_manager import KeyInfo
 from cline_utils.dependency_system.utils.cache_manager import cache_manager, cached
-from cline_utils.dependency_system.utils.config_manager import ConfigManager
-from cline_utils.dependency_system.utils.path_utils import (
-    get_project_root,
-    normalize_path,
+from cline_utils.dependency_system.utils.cache_manager import (
+    get_project_root_cached as get_project_root,
 )
+from cline_utils.dependency_system.utils.cache_manager import (
+    normalize_path_cached as normalize_path,
+)
+from cline_utils.dependency_system.utils.config_manager import ConfigManager
 from cline_utils.dependency_system.utils.phase_tracker import PhaseTracker
 
 logger = logging.getLogger(__name__)
 
 # Default model configuration
 DEFAULT_MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
-MODEL_INSTANCE: Optional[Any] = None  # Can be Llama or SentenceTransformer
-SELECTED_DEVICE: Optional[str] = None
-SELECTED_MODEL_CONFIG: Optional[Dict[str, Any]] = None
-TOKENIZER_INSTANCE: Optional[Any] = None
+_model_instance: Optional[Any] = None  # Can be Llama or SentenceTransformer
+_selected_device_cache: Optional[str] = None
+_selected_model_config: Optional[Dict[str, Any]] = None
+_tokenizer_instance: Optional[Any] = None
 
 # Locks
 MODEL_LOCK = threading.Lock()
@@ -80,6 +99,9 @@ MAX_CONTEXT_LENGTH = 32768
 SIM_CACHE_MAXSIZE = 100_000
 SIM_CACHE_TTL_SEC = 7 * 24 * 60 * 60  # 7 days
 SIM_CACHE_NEGATIVE_RESULTS = True
+# Bump when SES construction/token accounting changes so unchanged source files
+# still get refreshed embeddings + ses/full token metadata.
+EMBEDDING_METADATA_VERSION = "2.3_EnhancedSES"
 
 
 def _get_available_vram() -> float:
@@ -90,7 +112,7 @@ def _get_available_vram() -> float:
         torch.cuda.synchronize()
         # Use mem_get_info() which returns (free_memory, total_memory) directly
         # This is more accurate than manual calculation
-        free_memory, total_memory = torch.cuda.mem_get_info(0)
+        free_memory, _total_memory = torch.cuda.mem_get_info(0)
         return free_memory / (1024**3)  # Convert to GB
     except Exception as e:
         logger.warning(f"Failed to get VRAM info: {e}")
@@ -155,8 +177,8 @@ def _get_best_device() -> str:
 
 def _select_device() -> str:
     """Selects device based on config override or automatic detection."""
-    global SELECTED_DEVICE
-    if SELECTED_DEVICE is None:
+    global _selected_device_cache
+    if _selected_device_cache is None:
         config_manager = ConfigManager()
         config_device = (
             config_manager.config.get("compute", {})
@@ -168,7 +190,7 @@ def _select_device() -> str:
                 logger.warning(
                     "Config specified 'cuda', but not available. Auto-detecting."
                 )
-                SELECTED_DEVICE = _get_best_device()
+                _selected_device_cache = _get_best_device()
             elif config_device == "mps" and not (
                 sys.platform == "darwin"
                 and hasattr(torch.backends, "mps")
@@ -178,17 +200,17 @@ def _select_device() -> str:
                 logger.warning(
                     "Config specified 'mps', but not available. Auto-detecting."
                 )
-                SELECTED_DEVICE = _get_best_device()
+                _selected_device_cache = _get_best_device()
             else:
                 logger.debug(f"Using device specified in config: {config_device}")
-                SELECTED_DEVICE = config_device
+                _selected_device_cache = config_device
         elif config_device == "auto":
             logger.debug("Auto-detecting device.")
-            SELECTED_DEVICE = _get_best_device()
+            _selected_device_cache = _get_best_device()
         else:
             logger.warning(f"Invalid device '{config_device}'. Auto-detecting.")
-            SELECTED_DEVICE = _get_best_device()
-    return SELECTED_DEVICE or "cpu"
+            _selected_device_cache = _get_best_device()
+    return _selected_device_cache or "cpu"
 
 
 def _verify_qwen3_model(model_path: str) -> bool:
@@ -232,6 +254,167 @@ def _verify_qwen3_model(model_path: str) -> bool:
         return False
 
 
+def _download_with_retry(
+    url: str,
+    path: str,
+    description: str,
+    max_retries: int = 5,
+    initial_delay: float = 1.0,
+    use_phase_tracker: bool = False,
+) -> bool:
+    """
+    Downloads a file with exponential backoff retry logic and download resume capabilities.
+
+    Uses exponential backoff with jitter for transient failures, but aborts immediately
+    on permanent client HTTP errors (400, 401, 403, 404). Supports resuming partial
+    downloads via the HTTP 'Range' header.
+    """
+    import random
+    import time
+
+    if (
+        not url.strip().startswith(("http://", "https://"))
+        or "\n" in url
+        or "\r" in url
+    ):
+        logger.error(f"Invalid URL or scheme for file download: {url}")
+        return False
+
+    model_dir = os.path.dirname(path)
+    if model_dir:
+        os.makedirs(model_dir, exist_ok=True)
+
+    downloaded = 0
+    total_size = 0
+    tracker = None
+
+    for attempt in range(max_retries):
+        try:
+            req = Request(url)
+            req.add_header("User-Agent", "LLMRPG-Downloader/1.0")
+
+            is_resume = False
+            if downloaded > 0:
+                req.add_header("Range", f"bytes={downloaded}-")
+                is_resume = True
+                logger.info(
+                    f"Attempting to resume download for {description} from byte {downloaded} "
+                    f"(attempt {attempt + 1}/{max_retries})"
+                )
+            else:
+                logger.info(
+                    f"Starting download for {description} (attempt {attempt + 1}/{max_retries})"
+                )
+
+            with urlopen(req) as response:
+                status: int = int(getattr(response, "status", 200))
+                headers = response.info()
+                content_len = int(headers.get("Content-Length", 0))
+
+                # Handle HTTP response code.
+                if is_resume and status == 206:
+                    if total_size == 0:
+                        total_size = downloaded + content_len
+                    open_mode = "ab"
+                    logger.debug(
+                        f"Server accepted Range request (status 206). Resuming at byte {downloaded}."
+                    )
+                else:
+                    if is_resume:
+                        logger.warning(
+                            f"Server ignored Range request (status {status}). Restarting download from scratch."
+                        )
+                    downloaded = 0
+                    total_size = content_len
+                    open_mode = "wb"
+
+                chunk_size = 8192
+
+                if use_phase_tracker and tracker is None:
+                    tracker = PhaseTracker(
+                        total=total_size, phase_name=description, unit="bytes"
+                    )
+                    tracker.current = downloaded
+                    cast(Any, tracker).__enter__()
+                elif tracker is not None:
+                    tracker.set_total(total_size)
+                    tracker.current = downloaded
+
+                with open(path, open_mode) as f:
+                    while True:
+                        chunk = response.read(chunk_size)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+
+                        if tracker:
+                            tracker.update(len(chunk), description=f"{downloaded}/{total_size} bytes")
+                        elif total_size > 0:
+                            progress = (downloaded / total_size) * 100
+                            print(
+                                f"\rDownload progress ({description}): {progress:.1f}% ({downloaded}/{total_size} bytes)",
+                                end="",
+                                flush=True,
+                            )
+
+                if not tracker and total_size > 0:
+                    print()  # Final progress newline
+
+                if tracker:
+                    cast(Any, tracker).__exit__(None, None, None)
+                    tracker = None
+
+                return True
+
+        except urllib.error.HTTPError as e:
+            logger.warning(f"Download HTTP error (status {e.code}) for {description}: {e.reason}")
+            if e.code in (400, 401, 403, 404):
+                logger.error(f"Permanent HTTP error {e.code} encountered. Aborting download.")
+                if tracker:
+                    cast(Any, tracker).__exit__(type(e), e, e.__traceback__)
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                return False
+
+            if attempt < max_retries - 1:
+                delay = min(30.0, initial_delay * (2**attempt) + random.uniform(0.0, 1.0))
+                logger.info(f"Retrying transient HTTP error in {delay:.2f} seconds...")
+                time.sleep(delay)
+            else:
+                logger.error(f"Failed to download {description} after {max_retries} attempts due to HTTP errors.")
+                if tracker:
+                    cast(Any, tracker).__exit__(type(e), e, e.__traceback__)
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                return False
+
+        except Exception as e:
+            logger.warning(f"Download attempt {attempt + 1} failed for {description}: {e}")
+            if attempt < max_retries - 1:
+                delay = min(30.0, initial_delay * (2**attempt) + random.uniform(0.0, 1.0))
+                logger.info(f"Retrying in {delay:.2f} seconds...")
+                time.sleep(delay)
+            else:
+                logger.error(f"Failed to download {description} after {max_retries} attempts.")
+                if tracker:
+                    cast(Any, tracker).__exit__(type(e), e, e.__traceback__)
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                return False
+
+    return False
+
+
 def _download_qwen3_model(model_path: str) -> bool:
     """Download the Qwen3-Embedding-4B-Q6_K model if it doesn't exist or is invalid."""
     # First check if model exists and is valid
@@ -254,63 +437,37 @@ def _download_qwen3_model(model_path: str) -> bool:
     # Qwen3-Embedding-4B-Q6_K download URL (using resolve endpoint for direct download)
     model_url = "https://huggingface.co/Qwen/Qwen3-Embedding-4B-GGUF/resolve/main/Qwen3-Embedding-4B-Q6_K.gguf"
 
-    logger.info(f"Downloading Qwen3 model from {model_url} to {model_path}")
+    success = _download_with_retry(
+        url=model_url,
+        path=model_path,
+        description="Downloading Qwen3",
+        use_phase_tracker=True,
+    )
 
-    try:
-        # Download with progress reporting
-        with urllib.request.urlopen(model_url) as response:
-            total_size = int(response.headers.get("Content-Length", 0))
-            downloaded = 0
-            chunk_size = 8192
-
-            with open(model_path, "wb") as f:
-                with PhaseTracker(
-                    total=total_size, phase_name="Downloading Qwen3", unit="bytes"
-                ) as tracker:
-                    while True:
-                        chunk = response.read(chunk_size)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        tracker.update(
-                            len(chunk), description=f"{downloaded}/{total_size} bytes"
-                        )
-
-        # Verify download
-        if os.path.exists(model_path) and os.path.getsize(model_path) > 0:
-            # Final verification after download
-            if _verify_qwen3_model(model_path):
-                logger.debug(
-                    f"Successfully downloaded and verified Qwen3 model to {model_path}"
-                )
-                return True
-            else:
-                logger.error("Downloaded Qwen3 model failed verification")
-                try:
-                    os.remove(model_path)
-                except:
-                    pass
-                return False
+    if success:
+        # Final verification after download
+        if _verify_qwen3_model(model_path):
+            logger.debug(
+                f"Successfully downloaded and verified Qwen3 model to {model_path}"
+            )
+            return True
         else:
-            logger.error(f"Download failed - file not found or empty: {model_path}")
-            return False
-
-    except Exception as e:
-        logger.error(f"Failed to download Qwen3 model: {e}")
-        if os.path.exists(model_path):
+            logger.error("Downloaded Qwen3 model failed verification")
             try:
                 os.remove(model_path)
-            except OSError:
+            except:
                 pass
+            return False
+    else:
+        logger.error(f"Download failed: {model_path}")
         return False
 
 
 def _select_best_model() -> Dict[str, Any]:
     """Select the best embedding model based on hardware and config."""
-    global SELECTED_MODEL_CONFIG
-    if SELECTED_MODEL_CONFIG is not None:
-        return SELECTED_MODEL_CONFIG
+    global _selected_model_config
+    if _selected_model_config is not None:
+        return _selected_model_config
 
     config_manager = ConfigManager()
     model_selection = config_manager.get_embedding_setting("model_selection", "auto")
@@ -329,11 +486,11 @@ def _select_best_model() -> Dict[str, Any]:
         ):
             _download_qwen3_model(model_config["path"])
 
-        SELECTED_MODEL_CONFIG = model_config
+        _selected_model_config = model_config
         return model_config
     elif model_selection == "mpnet":
-        SELECTED_MODEL_CONFIG = MODEL_CONFIGS["mpnet"].copy()
-        return SELECTED_MODEL_CONFIG
+        _selected_model_config = MODEL_CONFIGS["mpnet"].copy()
+        return _selected_model_config
 
     # Auto-detect
     device = _select_device()
@@ -343,8 +500,9 @@ def _select_best_model() -> Dict[str, Any]:
     qwen_config = MODEL_CONFIGS["qwen3-4b"].copy()
     qwen_config["path"] = config_manager.get_embedding_setting("qwen3_model_path")
 
-    mem_req = (
-        qwen_config["min_vram_gb"] if device == "cuda" else qwen_config["min_ram_gb"]
+    mem_req: float = float(
+        (qwen_config["min_vram_gb"] if device == "cuda" else qwen_config["min_ram_gb"])
+        or 0
     )
 
     if available_mem >= mem_req:
@@ -357,29 +515,41 @@ def _select_best_model() -> Dict[str, Any]:
         if os.path.exists(qwen_config["path"]) and _verify_qwen3_model(
             qwen_config["path"]
         ):
-            SELECTED_MODEL_CONFIG = qwen_config
+            _selected_model_config = qwen_config
             return qwen_config
         elif _download_qwen3_model(qwen_config["path"]):
-            SELECTED_MODEL_CONFIG = qwen_config
+            _selected_model_config = qwen_config
             return qwen_config
 
-    SELECTED_MODEL_CONFIG = MODEL_CONFIGS["mpnet"].copy()
-    return SELECTED_MODEL_CONFIG
+    _selected_model_config = MODEL_CONFIGS["mpnet"].copy()
+    return _selected_model_config
 
 
-def _get_tokenizer():
+def _get_tokenizer() -> Optional[Any]:
     """Lazily loads a tokenizer for token counting."""
-    global TOKENIZER_INSTANCE, RERANKER_TOKENIZER
+    global _tokenizer_instance, _reranker_tokenizer
 
-    if TOKENIZER_INSTANCE is not None:
-        return TOKENIZER_INSTANCE
+    if _tokenizer_instance is not None:
+        return _tokenizer_instance
 
-    # 1. Try reusing Reranker tokenizer if loaded
-    if RERANKER_TOKENIZER is not None:
-        TOKENIZER_INSTANCE = RERANKER_TOKENIZER
-        return TOKENIZER_INSTANCE
+    try:
+        model_name = None
+        if _selected_model_config and "name" in _selected_model_config:
+            model_name = _selected_model_config["name"]
+        _tokenizer_instance = tokenizer_factory.get_tokenizer(model_name)
+        if _tokenizer_instance is not None:
+            return _tokenizer_instance
+    except Exception as e:
+        logger.warning(f"Centralized tokenizer factory failed in embedding_manager: {e}")
 
-    # 2. Try loading from local reranker path
+    # Fallback to legacy checks if factory failed
+    try:
+        if "_reranker_tokenizer" in globals() and _reranker_tokenizer is not None:
+            _tokenizer_instance = _reranker_tokenizer
+            return _tokenizer_instance
+    except Exception:
+        pass
+
     try:
         project_root = get_project_root()
         local_model_path = os.path.join(project_root, "models", "qwen3_reranker")
@@ -388,10 +558,11 @@ def _get_tokenizer():
         ):
             from transformers import AutoTokenizer
 
-            TOKENIZER_INSTANCE = AutoTokenizer.from_pretrained(
-                local_model_path, trust_remote_code=True
+            _tokenizer_instance = cast(
+                Any,
+                AutoTokenizer.from_pretrained(local_model_path),  # type: ignore
             )
-            return TOKENIZER_INSTANCE
+            return _tokenizer_instance
     except Exception as e:
         logger.warning(f"Failed to load tokenizer from local path: {e}")
 
@@ -400,25 +571,18 @@ def _get_tokenizer():
 
 def _count_tokens(text: str, tokenizer: Any = None) -> int:
     """Count tokens in text using tokenizer or fallback estimate."""
-    if tokenizer is not None:
-        try:
-            return len(tokenizer.encode(text, add_special_tokens=False))
-        except Exception:
-            pass
-
-    # Fallback: Rough estimate (4 chars per token is standard rule of thumb)
-    return len(text) // 4
+    return tokenizer_factory.count_tokens(text, tokenizer)
 
 
 def _load_model(n_ctx: int = 8192):
     """Loads the embedding model based on hardware capabilities."""
-    global MODEL_INSTANCE, SELECTED_MODEL_CONFIG
+    global _model_instance, _selected_model_config
 
-    if MODEL_INSTANCE is not None:
+    if _model_instance is not None:
         # Check if we need to reload due to context size
-        if SELECTED_MODEL_CONFIG and SELECTED_MODEL_CONFIG["type"] == "gguf":
+        if _selected_model_config and _selected_model_config["type"] == "gguf":
             try:
-                current_n_ctx = MODEL_INSTANCE.n_ctx()
+                current_n_ctx = _model_instance.n_ctx()
                 if current_n_ctx < n_ctx:
                     logger.debug(
                         f"Reloading model to increase context from {current_n_ctx} to {n_ctx}"
@@ -426,26 +590,26 @@ def _load_model(n_ctx: int = 8192):
                     _unload_model()
                 else:
                     # Existing context is sufficient
-                    return MODEL_INSTANCE
+                    return _model_instance
             except AttributeError:
                 # Fallback if n_ctx() not available
                 pass
         elif (
-            SELECTED_MODEL_CONFIG
-            and SELECTED_MODEL_CONFIG["type"] == "sentence-transformer"
+            _selected_model_config
+            and _selected_model_config["type"] == "sentence-transformer"
         ):
             # Update max_seq_length for SentenceTransformer without reload
-            if hasattr(MODEL_INSTANCE, "max_seq_length"):
-                if MODEL_INSTANCE.max_seq_length < n_ctx:
-                    MODEL_INSTANCE.max_seq_length = n_ctx
-            return MODEL_INSTANCE
+            if hasattr(_model_instance, "max_seq_length"):
+                if _model_instance.max_seq_length < n_ctx:
+                    _model_instance.max_seq_length = n_ctx
+            return _model_instance
 
-    if MODEL_INSTANCE is None:
-        SELECTED_MODEL_CONFIG = _select_best_model()
+    if _model_instance is None:
+        _selected_model_config = _select_best_model()
         device = _select_device()
 
         try:
-            if SELECTED_MODEL_CONFIG["type"] == "gguf":
+            if _selected_model_config["type"] == "gguf":
                 # Load GGUF model with llama-cpp-python
                 if Llama is None or llama_cpp is None:
                     logger.error(
@@ -473,7 +637,7 @@ def _load_model(n_ctx: int = 8192):
                     None, ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p
                 )
 
-                def noop_log_callback(level, text, user_data):
+                def noop_log_callback(level: int, text: bytes, user_data: int) -> None:
                     pass
 
                 # Keep a reference to prevent GC (Critical!)
@@ -482,8 +646,8 @@ def _load_model(n_ctx: int = 8192):
 
                 llama_cpp.llama_log_set(_C_LOG_CALLBACK_REF, ctypes.c_void_p())
 
-                MODEL_INSTANCE = Llama(
-                    model_path=SELECTED_MODEL_CONFIG["path"],
+                _model_instance = Llama(
+                    model_path=_selected_model_config["path"],
                     embedding=True,
                     n_ctx=n_ctx,
                     n_batch=512,
@@ -495,73 +659,49 @@ def _load_model(n_ctx: int = 8192):
                     verbose=False,
                 )
                 logger.debug(
-                    f"Loaded GGUF model: {SELECTED_MODEL_CONFIG['name']} on device: {device}"
+                    f"Loaded GGUF model: {_selected_model_config['name']} on device: {device}"
                 )
 
-            elif SELECTED_MODEL_CONFIG["type"] == "sentence-transformer":
+            elif _selected_model_config["type"] == "sentence-transformer":
                 # Load sentence-transformers model with proper device handling
                 from sentence_transformers import SentenceTransformer
 
                 try:
-                    MODEL_INSTANCE = SentenceTransformer(
-                        SELECTED_MODEL_CONFIG["name"], device=device
+                    _model_instance = SentenceTransformer(
+                        _selected_model_config["name"], device=device
                     )
                 except Exception:
                     # Fallback to CPU if device init fails
-                    MODEL_INSTANCE = SentenceTransformer(
-                        SELECTED_MODEL_CONFIG["name"], device="cpu"
+                    _model_instance = SentenceTransformer(
+                        _selected_model_config["name"], device="cpu"
                     )
                 logger.debug(
-                    f"Loaded sentence transformer: {SELECTED_MODEL_CONFIG['name']}"
+                    f"Loaded sentence transformer: {_selected_model_config['name']}"
                 )
 
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
             raise
 
-    return MODEL_INSTANCE
+    return _model_instance
 
 
 def _unload_model():
     """Unloads the embedding model."""
-    global MODEL_INSTANCE
-    if MODEL_INSTANCE is not None:
-        MODEL_INSTANCE = None
+    global _model_instance
+    if _model_instance is not None:
+        _model_instance = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
 
-def _encode_text(text: str, model_config: Dict[str, Any]) -> np.ndarray:
-    """Encode text using the appropriate model type with normalization."""
-    model = _load_model()
-
-    if model is None:
-        raise RuntimeError("Model not loaded properly")
-
-    if model_config["type"] == "gguf":
-        # GGUF model encoding (logging already suppressed via callback)
-        embedding = model.embed(text)
-        if embedding is None:
-            raise RuntimeError("GGUF model returned None")
-        arr = np.array(embedding, dtype=np.float32)
-    else:
-        arr = model.encode(text, show_progress_bar=True, convert_to_numpy=True)
-        arr = np.array(arr, dtype=np.float32)
-
-    norm = np.linalg.norm(arr)
-    if norm > 0:
-        arr = arr / norm
-    return arr
-
-
 # --- SES (Symbol Essence String) Logic ---
-
-
 def _load_project_symbol_map() -> Dict[str, Dict[str, Any]]:
     """Loads the project_symbol_map.json."""
+    from cline_utils.dependency_system.core import resolve_state_path
     try:
         core_dir = os.path.dirname(os.path.abspath(key_manager_module.__file__))
-        map_path = normalize_path(os.path.join(core_dir, PROJECT_SYMBOL_MAP_FILENAME))
+        map_path = normalize_path(resolve_state_path(PROJECT_SYMBOL_MAP_FILENAME, core_dir))
         if os.path.exists(map_path):
             with open(map_path, "r", encoding="utf-8") as f:
                 return json.load(f)
@@ -570,10 +710,53 @@ def _load_project_symbol_map() -> Dict[str, Dict[str, Any]]:
     return {}
 
 
+def _load_token_metadata(project_root: str) -> Dict[str, Dict[str, int]]:
+    """Loads token counts from metadata.json."""
+    metadata_path = os.path.join(
+        project_root,
+        "cline_utils",
+        "dependency_system",
+        "analysis",
+        "embeddings",
+        "metadata.json",
+    )
+    token_map: Dict[str, Dict[str, int]] = {}
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                keys = data.get("keys", {})
+                for key_data in keys.values():
+                    path = key_data.get("path")
+                    if not path:
+                        continue
+                    path = normalize_path(path)
+
+                    ses = key_data.get("ses_tokens")
+                    full = key_data.get("full_tokens")
+
+                    if ses is None and "tokens" in key_data:
+                        # Fallback for old structure
+                        ses = key_data["tokens"]
+
+                    if full is None and ses is not None:
+                        # Best guess if full_tokens is missing
+                        full = ses
+
+                    if ses is not None and full is not None:
+                        token_map[path] = {
+                            "ses_tokens": int(ses),
+                            "full_tokens": int(full),
+                        }
+        except Exception as e:
+            logger.warning(f"Failed to load token metadata: {e}")
+    return token_map
+
+
 def generate_symbol_essence_string(
     file_path: str,
     symbol_data: Dict[str, Any],
-    max_chars: int = 4000,
+    max_chars: int = 12288,
     symbol_map: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
@@ -595,21 +778,164 @@ def generate_symbol_essence_string(
     project_root = get_project_root()
     rel_path = os.path.relpath(file_path, project_root)
 
-    parts = []
+    parts: List[str] = []
 
     # 1. Header
-    mod_time = os.path.getmtime(file_path) if os.path.exists(file_path) else 0
     parts.append(
-        f"[FILE: {rel_path} | TYPE: {symbol_data.get('file_type', 'unknown')} | MOD: {mod_time}]"
+        f"[FILE: {rel_path} | TYPE: {symbol_data.get('file_type', 'unknown')}]"
     )
 
-    # 2. Classes (with Runtime Enhancements)
-    classes = symbol_data.get("classes", [])
+    # --- Size-Adaptive Logic ---
+    # Check for token count to decide whether to use full content or summarized SES
+    full_tokens = symbol_data.get("full_tokens")
+    content = ""
+    transparency_metadata = None
+
+    # Try to load content if not already loaded or if we need to count tokens
+    if os.path.exists(file_path):
+        raw_content, transparency_metadata = read_file_transparently(file_path)
+        if raw_content is not None:
+            content = strip_auto_generated_blocks(raw_content, file_path)
+        else:
+            content = ""
+
+    connection_maps = extract_connection_map_metadata(content, transparency_metadata)
+    if connection_maps:
+        parts.append("CONNECTION_MAPS:")
+        for record in connection_maps[:200]:
+            target_line = record.get("target_line")
+            target_line_text = str(target_line) if target_line is not None else "?"
+            source_line = record.get("source_line")
+            source_line_text = str(source_line) if source_line is not None else "?"
+            parts.append(
+                "  "
+                f"{record.get('source_symbol', 'unknown')}:{source_line_text} -> "
+                f"{record.get('target_key', '?')}("
+                f"{record.get('target_symbol', 'file')}:{target_line_text}) "
+                f"{{{record.get('dep_char', '?')}}}"
+            )
+        if len(connection_maps) > 200:
+            parts.append("  ... (truncated)")
+
+    if full_tokens is None and content:
+        # Look up in metadata.json first
+        token_meta = _load_token_metadata(get_project_root())
+        norm_file_path = normalize_path(file_path)
+        if norm_file_path in token_meta:
+            full_tokens = token_meta[norm_file_path].get("full_tokens")
+
+    if full_tokens is None and content:
+        # Final fallback: load tokenizer
+        try:
+            tokenizer = _get_tokenizer()
+            if tokenizer:
+                full_tokens = _count_tokens(content, tokenizer)
+        except Exception as e:
+            logger.warning(f"Could not count tokens for {file_path}: {e}")
+
+    # Small-file full-content mode is intentionally limited to documentation-like files.
+    # Structured/code files (especially SQL/JSON/Svelte) must stay distilled.
+    file_type = str(symbol_data.get("file_type", "")).lower()
+    is_doc_like = file_type == "md" or file_path.lower().endswith(
+        (".md", ".txt", ".rst")
+    )
+    if full_tokens and full_tokens < 12800 and content and is_doc_like:
+        current_len = len("\n".join(parts))
+        max_content_chars = max(0, max_chars - current_len - len("CONTENT:\n"))
+        if max_content_chars > 0:
+            parts.append(f"CONTENT:\n{content[:max_content_chars]}")
+        return "\n".join(parts)
+
+    # --- Large File SES Generation (Summarization) ---
+
+    # 2. Imports (Explicit - Added for Svelte/Large Files)
+    imports = cast(List[Dict[str, Any]], symbol_data.get("imports", []))
+    if imports:
+        parts.append("IMPORTS:")
+        # Deduplicate imports
+        seen_imports: Set[str] = set()
+        for imp in imports:
+            if isinstance(imp, str):
+                if imp not in seen_imports:
+                    seen_imports.add(imp)
+                    parts.append(f"  {imp}")
+                continue
+            path = imp.get("path")
+            if path and isinstance(path, str) and path not in seen_imports:
+                seen_imports.add(path)
+                parts.append(f"  {path}")
+
+    # Compact Python runtime profile near the top so high-signal fields survive truncation.
+    if file_type == "py":
+        class_count = len(cast(List[Any], symbol_data.get("classes", [])))
+        function_count = len(cast(List[Any], symbol_data.get("functions", [])))
+        call_count = len(cast(List[Any], symbol_data.get("calls", [])))
+        attr_access_count = len(
+            cast(List[Any], symbol_data.get("attribute_accesses", []))
+        )
+        type_ref_count = len(cast(List[Any], symbol_data.get("type_references", [])))
+        parts.append(
+            "PY_RUNTIME_PROFILE: "
+            f"classes={class_count}, functions={function_count}, "
+            f"calls={call_count}, attribute_accesses={attr_access_count}, "
+            f"type_references={type_ref_count}"
+        )
+
+        top_decorators: Dict[str, int] = {}
+        for d in cast(List[Dict[str, Any]], symbol_data.get("decorators_used", [])):
+            d_name = str(d.get("name", "")).strip()
+            if d_name:
+                top_decorators[d_name] = top_decorators.get(d_name, 0) + 1
+        if top_decorators:
+            decorator_summary = ", ".join(
+                f"{k} x{v}" if v > 1 else k
+                for k, v in sorted(
+                    top_decorators.items(), key=lambda kv: (-kv[1], kv[0])
+                )[:100]
+            )
+            parts.append(f"PY_TOP_DECORATORS: {decorator_summary}")
+
+        top_exceptions: Dict[str, int] = {}
+        for exc in cast(List[Dict[str, Any]], symbol_data.get("exceptions_raised", [])):
+            exc_name = str(exc.get("type_name_str", "")).strip()
+            if exc_name:
+                top_exceptions[exc_name] = top_exceptions.get(exc_name, 0) + 1
+        if top_exceptions:
+            exception_summary = ", ".join(
+                f"{k} x{v}" if v > 1 else k
+                for k, v in sorted(
+                    top_exceptions.items(), key=lambda kv: (-kv[1], kv[0])
+                )[:100]
+            )
+            parts.append(f"PY_TOP_EXCEPTIONS: {exception_summary}")
+
+        top_type_refs: Dict[str, int] = {}
+        for t in cast(List[Dict[str, Any]], symbol_data.get("type_references", [])):
+            t_name = str(t.get("type_name_str", "")).strip()
+            if t_name:
+                top_type_refs[t_name] = top_type_refs.get(t_name, 0) + 1
+        if top_type_refs:
+            type_ref_summary = ", ".join(
+                f"{k} x{v}" if v > 1 else k
+                for k, v in sorted(
+                    top_type_refs.items(),
+                    key=lambda kv: (-kv[1], kv[0]),
+                )[:100]
+            )
+            parts.append(f"PY_TOP_TYPES: {type_ref_summary}")
+
+    classes = cast(List[Dict[str, Any]], symbol_data.get("classes", []))
     if classes:
         for c in classes:
-            c_name = c["name"]
-            c_doc = (c.get("docstring") or "").strip()
-            parts.append(f"CLASS: {c_name}")
+            c_name = str(c.get("name", "unknown")).strip()
+            c_doc = str(c.get("docstring") or "").strip()
+            if len(c_doc) > 500:
+                c_doc = c_doc[:500] + "..."
+            if c_doc:
+                parts.append(f"CLASS: {c_name}")
+                parts.append(f"  DOC: {c_doc}")
+            else:
+                parts.append(f"CLASS: {c_name}")
 
             # Add inheritance info (runtime)
             inheritance = c.get("inheritance", {})
@@ -628,8 +954,21 @@ def generate_symbol_essence_string(
             # Methods with enhanced runtime information
             methods = c.get("methods", [])
             if methods:
-                for m in methods:
-                    m_name = m["name"]
+                method_names: List[str] = []
+                for m_item in methods:
+                    m_name = str(m_item.get("name", "")).strip()
+                    if m_name:
+                        method_names.append(m_name)
+                if method_names:
+                    shown_names = method_names[:500]
+                    suffix = ", ..." if len(method_names) > 500 else ""
+                    parts.append(f"  METHODS: {', '.join(shown_names)}{suffix}")
+
+                max_method_details = (
+                    100 if (full_tokens and full_tokens > 20000) else 500
+                )
+                for m in methods[:max_method_details]:
+                    m_name = str(m.get("name", "unknown"))
 
                     # Prefer runtime signature over params
                     m_sig = m.get("signature")
@@ -642,6 +981,8 @@ def generate_symbol_essence_string(
                         parts.append(f"  METHOD: {m_name}({m_param_str})")
 
                     m_doc = (m.get("docstring") or "").strip()
+                    if len(m_doc) > 500:
+                        m_doc = m_doc[:500] + "..."
                     if m_doc:
                         parts.append(f"    DOC: {m_doc}")
 
@@ -657,9 +998,13 @@ def generate_symbol_essence_string(
                         }
                         if filtered_annot:
                             annot_str = ", ".join(
-                                f"{k}={v}" for k, v in list(filtered_annot.items())[:3]
+                                f"{k}={v}" for k, v in list(filtered_annot.items())
                             )
                             parts.append(f"    TYPES: {annot_str}")
+
+                        return_type = type_annot.get("return_type")
+                        if return_type and return_type != "<class 'NoneType'>":
+                            parts.append(f"    RETURN_TYPE: {return_type}")
 
                     # Add key scope references (runtime)
                     scope_refs = m.get("scope_references", {})
@@ -685,30 +1030,44 @@ def generate_symbol_essence_string(
                                 "set",
                                 "tuple",
                             ]
-                        ][
-                            :10
-                        ]  # Limit to top 10
+                        ][:100]
                         if significant_globals:
                             parts.append(
                                 f"    GLOBALS: {', '.join(significant_globals)}"
                             )
+
+                    nonlocals_list = scope_refs.get("nonlocals", [])
+                    if nonlocals_list:
+                        parts.append(f"    NONLOCALS: {', '.join(nonlocals_list)}")
+
+                    # Closure dependencies (runtime)
+                    closure_deps = m.get("closure_dependencies", [])
+                    if closure_deps:
+                        parts.append(
+                            f"    CLOSURE_DEPENDENCIES: {', '.join(closure_deps)}"
+                        )
 
                     # Add attribute accesses (runtime) - shows duck-typing contracts
                     attr_accesses = m.get("attribute_accesses", [])
                     if attr_accesses:
                         significant_attrs = [
                             a for a in attr_accesses if a not in ["self", "__class__"]
-                        ][:5]
+                        ]
                         if significant_attrs:
                             parts.append(
                                 f"    ACCESSES: {', '.join(significant_attrs)}"
                             )
+                if len(cast(List[Any], methods)) > max_method_details:
+                    parts.append(
+                        f"  ... ({len(cast(List[Any], methods)) - max_method_details} methods omitted)"
+                    )
 
     # 3. Top-level Functions (with Runtime Enhancements)
     functions = symbol_data.get("functions", [])
     if functions:
         parts.append("FUNCTIONS:")
-        for f in functions:
+        functions_list = cast(List[Dict[str, Any]], functions)
+        for f in functions_list[:1000]:
             name = f["name"]
 
             # Prefer runtime signature
@@ -722,6 +1081,8 @@ def generate_symbol_essence_string(
                 parts.append(f"  {name}({param_str})")
 
             doc = (f.get("docstring") or "").strip()
+            if len(doc) > 500:
+                doc = doc[:500] + "..."
             if doc:
                 parts.append(f"    DOC: {doc}")
 
@@ -734,9 +1095,14 @@ def generate_symbol_essence_string(
                 }
                 if filtered_annot:
                     annot_str = ", ".join(
-                        f"{k}={v}" for k, v in list(filtered_annot.items())[:3]
+                        f"{k}={v}" for k, v in list(filtered_annot.items())
                     )
                     parts.append(f"    TYPES: {annot_str}")
+
+                # Add return type if available
+                return_type = type_annot.get("return_type")
+                if return_type and return_type != "<class 'NoneType'>":
+                    parts.append(f"    RETURN_TYPE: {return_type}")
 
             # Add scope references
             scope_refs = f.get("scope_references", {})
@@ -757,26 +1123,52 @@ def generate_symbol_essence_string(
                         "set",
                         "tuple",
                     ]
-                ][:10]
+                ]
                 if significant_globals:
                     parts.append(f"    GLOBALS: {', '.join(significant_globals)}")
 
-    # 4. Outgoing Calls (from AST - still useful for call graphs)
+            nonlocals_list = scope_refs.get("nonlocals", [])
+            if nonlocals_list:
+                parts.append(f"    NONLOCALS: {', '.join(nonlocals_list)}")
+
+            # Closure dependencies (runtime)
+            closure_deps = f.get("closure_dependencies", [])
+            if closure_deps:
+                parts.append(f"    CLOSURE_DEPENDENCIES: {', '.join(closure_deps)}")
+        if len(cast(List[Any], functions)) > 1000:
+            parts.append("  ... (functions truncated)")
+
+    # 4. Outgoing Calls (from AST/runtime)
     calls = symbol_data.get("calls", [])
     if calls:
-        unique_calls = set()
-        for c in calls:
-            src = c.get("potential_source")
-            if src:
-                unique_calls.add(src)
+        call_counts: Dict[str, int] = {}
+        calls_list = cast(List[Dict[str, Any]], calls)
+        for c in calls_list:
+            target = str(c.get("target_name") or "").strip()
+            source = str(c.get("potential_source") or "").strip()
 
-        if unique_calls:
-            sorted_calls = sorted(list(unique_calls))[:15]  # Limit to top 15
-            parts.append(f"CALLS: {', '.join(sorted_calls)}")
+            if source and target:
+                call_key = f"{source}.{target}"
+            else:
+                call_key = target or source
+
+            if not call_key:
+                continue
+            call_counts[call_key] = call_counts.get(call_key, 0) + 1
+
+        if call_counts:
+            parts.append("CALLS:")
+            for call_key, count in sorted(
+                call_counts.items(), key=lambda kv: (-kv[1], kv[0])
+            )[:350]:
+                if count > 1:
+                    parts.append(f"  {call_key} x{count}")
+                else:
+                    parts.append(f"  {call_key}")
 
     # 5. Incoming Connections (CALLED_BY) - from imports analysis
     if symbol_map:
-        called_by = set()
+        called_by: Set[str] = set()
         fname = os.path.basename(file_path)
         fname_no_ext = os.path.splitext(fname)[0]
 
@@ -786,8 +1178,12 @@ def generate_symbol_essence_string(
 
             other_imports = other_data.get("imports", [])
             for imp in other_imports:
-                imp_path = imp.get("path") if isinstance(imp, dict) else imp
-                if not imp_path:
+                # Handle both string and dict import formats
+                if isinstance(imp, str):
+                    imp_path = imp
+                else:
+                    imp_path = imp.get("path")
+                if not imp_path or not isinstance(imp_path, str):
                     continue
 
                 # Match on path or filename
@@ -800,8 +1196,725 @@ def generate_symbol_essence_string(
                     break
 
         if called_by:
-            sorted_called_by = sorted(list(called_by))[:10]  # Limit to top 10
+            sorted_called_by = sorted(list(called_by))
             parts.append(f"CALLED_BY: {', '.join(sorted_called_by)}")
+
+    # Exports (all code/data files, not only web)
+    exports = symbol_data.get("exports", [])
+    if exports:
+        parts.append("EXPORTS:")
+        seen_exports: Set[str] = set()
+        exports_list = cast(List[Dict[str, Any]], exports)
+        for e in exports_list:
+            if isinstance(e, str):
+                e_name = e.strip()
+                e_from = ""
+            elif isinstance(e, dict):
+                e_name = str(e.get("name") or e.get("default") or "unknown").strip()
+                e_from = str(e.get("from") or "").strip()
+            else:
+                continue
+            if not e_name:
+                continue
+            line = f"{e_name} <- {e_from}" if e_from else e_name
+            if line not in seen_exports:
+                seen_exports.add(line)
+                parts.append(f"  {line}")
+            if len(seen_exports) >= 400:
+                break
+
+    # Significant literal assignments (useful for constants/config wiring)
+    lit_assigns = symbol_data.get("literal_assignments", [])
+    if lit_assigns:
+        parts.append("LITERAL_ASSIGNMENTS:")
+        seen_assigns: Set[str] = set()
+        for a in lit_assigns:
+            a_name = str(a.get("name", "unknown")).strip()
+            a_val = str(a.get("value", "")).replace("\n", " ").strip()
+            if not a_val:
+                continue
+            if len(a_val) > 500:
+                a_val = a_val[:500] + "..."
+            line = f"{a_name} = {a_val}"
+            if line not in seen_assigns:
+                seen_assigns.add(line)
+                parts.append(f"  {line}")
+            if len(seen_assigns) >= 250:
+                break
+
+    # Python runtime-heavy fields (already collected in symbol_map)
+    if file_type == "py":
+        globals_defined = symbol_data.get("globals_defined", [])
+        if globals_defined:
+            g_names: List[str] = []
+            for g in globals_defined:
+                g_name = str(g.get("name", "")).strip()
+                if g_name:
+                    g_names.append(g_name)
+            if g_names:
+                parts.append(f"GLOBALS_DEFINED: {', '.join(sorted(set(g_names)))}")
+
+        decorators_used = symbol_data.get("decorators_used", [])
+        if decorators_used:
+            d_names: List[str] = []
+            for d in cast(List[Dict[str, Any]], decorators_used):
+                d_name = str(d.get("name", "")).strip()
+                if d_name:
+                    d_names.append(d_name)
+            if d_names:
+                parts.append(f"DECORATORS_USED: {', '.join(sorted(set(d_names)))}")
+
+        exceptions_handled = symbol_data.get("exceptions_handled", [])
+        if exceptions_handled:
+            ex_names: List[str] = []
+            for ex in cast(List[Dict[str, Any]], exceptions_handled):
+                ex_name = str(ex.get("type_name_str", "")).strip()
+                if ex_name:
+                    ex_names.append(ex_name)
+            if ex_names:
+                parts.append(f"EXCEPTIONS_HANDLED: {', '.join(sorted(set(ex_names)))}")
+
+        with_contexts_used = symbol_data.get("with_contexts_used", [])
+        if with_contexts_used:
+            with_entries: List[str] = []
+            for w in cast(List[Dict[str, Any]], with_contexts_used):
+                context_expr = str(w.get("context_expr_str", "")).strip()
+                if context_expr:
+                    if len(context_expr) > 500:
+                        context_expr = context_expr[:500] + "..."
+                    with_entries.append(context_expr)
+            if with_entries:
+                parts.append(f"WITH_CONTEXTS: {', '.join(sorted(set(with_entries)))}")
+
+        inheritance = symbol_data.get("inheritance", [])
+        if inheritance:
+            pairs: Set[str] = set()
+            for h in cast(List[Dict[str, Any]], inheritance):
+                cls = str(h.get("class_name", "")).strip()
+                base = str(h.get("base_class_name", "")).strip()
+                if cls and base:
+                    pairs.add(f"{cls} -> {base}")
+            if pairs:
+                parts.append("INHERITANCE:")
+                for pair in sorted(pairs)[:500]:
+                    parts.append(f"  {pair}")
+
+        type_references = symbol_data.get("type_references", [])
+        if type_references:
+            type_counts: Dict[str, int] = {}
+            for t in cast(List[Dict[str, Any]], type_references):
+                t_name = str(t.get("type_name_str", "")).strip()
+                if not t_name:
+                    continue
+                type_counts[t_name] = type_counts.get(t_name, 0) + 1
+            if type_counts:
+                parts.append("TYPE_REFERENCES:")
+                for t_name, count in sorted(
+                    type_counts.items(), key=lambda kv: (-kv[1], kv[0])
+                )[:500]:
+                    if count > 1:
+                        parts.append(f"  {t_name} x{count}")
+                    else:
+                        parts.append(f"  {t_name}")
+
+        attribute_accesses = symbol_data.get("attribute_accesses", [])
+        if attribute_accesses:
+            access_counts: Dict[str, int] = {}
+            for a in cast(List[Dict[str, Any]], attribute_accesses):
+                target = str(a.get("target_name", "")).strip()
+                source = str(a.get("potential_source", "")).strip()
+                if source and target:
+                    access_key = f"{source}.{target}"
+                else:
+                    access_key = target or source
+                if not access_key:
+                    continue
+                access_counts[access_key] = access_counts.get(access_key, 0) + 1
+            if access_counts:
+                parts.append("ATTRIBUTE_ACCESS_PATTERNS:")
+                for access_key, count in sorted(
+                    access_counts.items(), key=lambda kv: (-kv[1], kv[0])
+                )[:350]:
+                    if count > 1:
+                        parts.append(f"  {access_key} x{count}")
+                    else:
+                        parts.append(f"  {access_key}")
+
+    # 6. Documentation & Web Metadata (NEW)
+    # If this is a doc, web, or data file, we may have links, images, scripts, or stylesheets
+    is_doc = symbol_data.get("file_type") == "md" or file_path.lower().endswith(
+        (".md", ".txt", ".rst")
+    )
+    is_web = symbol_data.get("file_type") in ("svelte", "html", "htm")
+    is_css = symbol_data.get("file_type") == "css"
+    is_csv = symbol_data.get("file_type") == "csv"
+    is_data = symbol_data.get("file_type") in ("json", "sql")
+
+    # CSS Specific: Collect imports for style-heavy files
+    if is_css:
+        raw_imports = cast(List[Dict[str, Any]], symbol_data.get("imports", []))
+        css_imports = [str(imp.get("url")) for imp in raw_imports if imp.get("url")]
+        if css_imports:
+            parts.append(f"CSS_IMPORTS: {', '.join(css_imports)}")
+
+    if is_csv and content:
+        parts.append("CSV_PREVIEW:")
+        preview_lines = content.splitlines()
+        preview = "\n".join(preview_lines)
+        if len(preview) > 5000:
+            preview = preview[:5000] + "..."
+        parts.append(textwrap.indent(preview, "  "))
+
+    # Links (Documents, Svelte, JSON, SQL)
+    links = symbol_data.get("links", [])
+    if links:
+        # Capturing the 'url' part of the links
+        link_urls: List[str] = []
+        seen_link_urls: Set[str] = set()
+        for lnk in cast(List[Dict[str, Any]], links):
+            u = cast(
+                Optional[str], lnk.get("url") or lnk.get("href") or lnk.get("path")
+            )
+            if u:
+                # Clean up URL to just filename for essence
+                if u.startswith("file:///"):
+                    u = os.path.basename(u)
+                if u not in seen_link_urls:
+                    seen_link_urls.add(u)
+                    link_urls.append(u)
+        if link_urls:
+            parts.append(f"LINKS: {', '.join(link_urls)}")
+
+    # Images (Documents, Svelte)
+    images = symbol_data.get("images", [])
+    if images:
+        img_srcs: List[str] = []
+        for img in cast(List[Dict[str, Any]], images):
+            src = cast(Optional[str], img.get("src") or img.get("url"))
+            if src:
+                img_srcs.append(os.path.basename(src))
+        if img_srcs:
+            parts.append(f"IMAGES: {', '.join(img_srcs)}")
+
+    # Scripts & Stylesheets (Web/Svelte)
+    if is_web:
+        scripts = symbol_data.get("scripts", [])
+        if scripts:
+            parts.append(f"SCRIPTS: {len(scripts)} block(s)")
+            for s in cast(List[Dict[str, Any]], scripts):
+                s_content = cast(str, s["content"]).strip()
+                # Show more content (up to 4000 chars)
+                lines: List[str] = s_content.split("\n")
+                if len(s_content) > 4000:
+                    preview = "\n".join(lines)
+                    if len(preview) > 4000:
+                        preview = preview[:4000] + "..."
+                    else:
+                        preview += "\n... (truncated)"
+                    s_content = preview
+
+                parts.append(f"  [Content]:\n{textwrap.indent(s_content, '    ')}")
+
+        stylesheets = symbol_data.get("stylesheets", [])
+        if stylesheets:
+            parts.append(f"STYLES: {len(stylesheets)} block(s)")
+            for s in cast(List[Dict[str, Any]], stylesheets):
+                s_content = cast(str, s["content"]).strip()
+                # Same truncation for styles
+                lines: List[str] = s_content.split("\n")
+                if len(lines) > 40 or len(s_content) > 2000:
+                    preview = "\n".join(lines)
+                    if len(preview) > 2000:
+                        preview = preview[:2000] + "..."
+                    else:
+                        preview += "\n... (truncated)"
+                    s_content = preview
+
+                parts.append(f"  [Content]:\n{textwrap.indent(s_content, '    ')}")
+
+        # Svelte Specifics
+        props = symbol_data.get("props", [])
+        if props:
+            temp_props = cast(List[Dict[str, Any]], props)
+            p_names: List[str] = [
+                cast(str, p["name"]) for p in temp_props if p.get("name")
+            ]
+            if p_names:
+                parts.append(f"PROPS: {', '.join(p_names)}")
+
+        state = symbol_data.get("state", [])
+        if state:
+            temp_state = cast(List[Dict[str, Any]], state)
+            s_names: List[str] = [
+                cast(str, s["name"]) for s in temp_state if s.get("name")
+            ]
+            if s_names:
+                parts.append(f"STATE: {', '.join(s_names)}")
+
+        data_store = symbol_data.get("reactive", [])
+        if data_store:
+            # Reactive statements ($: ...)
+            parts.append("REACTIVE:")
+            for r in cast(List[Dict[str, Any]], data_store):
+                content_text = cast(str, r.get("content", ""))
+                parts.append(f"  $: {content_text.strip()}")
+
+        logic = symbol_data.get("logic", [])
+        if logic:
+            parts.append("LOGIC:")
+            for l in cast(List[Dict[str, Any]], logic):
+                l_type = cast(str, l.get("type", "block")).upper()
+                l_content = cast(str, l.get("content", "")).replace("\n", " ").strip()
+                parts.append(f"  [{l_type}] {l_content}")
+
+        template_outline = symbol_data.get("template_outline", [])
+        if template_outline:
+            parts.append("TEMPLATE_OUTLINE:")
+            for line in cast(List[str], template_outline):
+                parts.append(f"  {line}")
+
+        # Render Distilled Template from Full Tree (Runtime distillation)
+        template_tree = symbol_data.get("template_tree", [])
+        if template_tree and not template_outline:
+            parts.append("DISTILLED TEMPLATE:")
+
+            # Helper to render tree to string list
+            def _render_tree(nodes: List[Dict[str, Any]], depth: int = 0) -> List[str]:
+                lines: List[str] = []
+                if depth > 20:
+                    return lines
+                indent = "  " * depth
+                for node in nodes:
+                    n_type = node.get("type")
+                    if n_type == "element":
+                        # Extract tag name from content or children
+                        tag = "<unknown>"
+                        attrs = ""
+
+                        # Inspect children for start_tag
+                        for child in node.get("children", []):
+                            if child.get("type") in ("start_tag", "self_closing_tag"):
+                                # Extract name/attributes from start_tag children
+                                for sub in child.get("children", []):
+                                    if sub.get("type") == "tag_name":
+                                        tag = sub.get("content", "")
+                                    elif sub.get("type") == "attribute":
+                                        # name/value
+                                        a_name = sub.get("name", "")
+                                        a_val = sub.get("value", "")
+                                        # clean quotes
+                                        if (
+                                            a_val.startswith(('"', "'"))
+                                            and len(a_val) >= 2
+                                        ):
+                                            a_val = a_val[1:-1]
+
+                                        if a_name == "id":
+                                            attrs += f"#{a_val}"
+                                        elif a_name == "class":
+                                            classes = a_val.split()
+                                            if classes:
+                                                attrs += "." + ".".join(classes)
+                                        elif a_name == "slot":
+                                            attrs += f"[slot={a_val}]"
+                                break
+
+                        if tag != "<unknown>":
+                            lines.append(f"{indent}<{tag}{attrs}>")
+                            lines.extend(
+                                _render_tree(node.get("children", []), depth + 1)
+                            )
+
+                    elif n_type in (
+                        "if_statement",
+                        "each_statement",
+                        "await_statement",
+                        "key_statement",
+                    ):
+                        # Logic blocks
+                        # Try to get the first line of content for the header
+                        content = node.get("content", "").split("\n")[0].strip()
+                        lines.append(f"{indent}{content}")
+                        lines.extend(_render_tree(node.get("children", []), depth + 1))
+
+                    elif n_type in (
+                        "else_block",
+                        "then_block",
+                        "catch_block",
+                        "else_if_block",
+                    ):
+                        # Branch blocks
+                        head = (
+                            n_type.replace("_block", "").replace("_", " ")
+                            if n_type
+                            else "branch"
+                        )
+                        lines.append(f"{indent}{head}")
+                        lines.extend(
+                            _render_tree(
+                                cast(List[Dict[str, Any]], node.get("children", [])),
+                                depth + 1,
+                            )
+                        )
+                return lines
+
+            parts.extend(_render_tree(template_tree))
+
+        components = symbol_data.get("components", [])
+        if components:
+            c_list = cast(List[Dict[str, Any]], components)
+            c_names = sorted(
+                list(set(cast(str, c.get("name")) for c in c_list if c.get("name")))
+            )
+            if c_names:
+                parts.append(f"COMPONENTS: {', '.join(c_names)}")
+
+    # JS/TS Specifics (outside web-only branch)
+    js_comments = symbol_data.get("comments", [])
+    if js_comments:
+        parts.append("COMMENTS / JSDOC:")
+        for c in cast(List[str], js_comments)[:500]:
+            parts.append(f"  // {c}")
+
+    js_literals = symbol_data.get("literals", [])
+    if js_literals:
+        parts.append("LITERALS:")
+        significant_literals = [
+            l
+            for l in cast(List[str], js_literals)
+            if any(
+                x in l.lower()
+                for x in [
+                    "/",
+                    "http",
+                    "select ",
+                    "insert ",
+                    "update ",
+                    "delete ",
+                    ".json",
+                    ".yaml",
+                    ".sql",
+                ]
+            )
+            or len(l) > 500
+        ]
+        for l in significant_literals[:500]:
+            parts.append(f'  "{l}"')
+
+    # JS/TS Body Essence (from enhanced analyzer)
+    for f in cast(List[Dict[str, Any]], symbol_data.get("functions", [])):
+        if "body_essence" in f:
+            f_name = str(f.get("name", "unknown"))
+            body_essence = str(f.get("body_essence", "")).strip()
+            if body_essence:
+                parts.append(f"  BODY ({f_name}):")
+                parts.append(f"    {body_essence}")
+
+    # Definitions (SQL, etc.)
+    is_data = file_type in ("sql", "json", "yaml", "xml", "csv")
+    if is_data:
+        sql_table_ops: Dict[str, Set[str]] = {}
+
+        def _track_sql_operation(table_name: str, op_name: str) -> None:
+            if not table_name:
+                return
+            normalized_table = table_name.strip().strip('"').lower()
+            if not normalized_table:
+                return
+            if normalized_table not in sql_table_ops:
+                sql_table_ops[normalized_table] = set()
+            if op_name:
+                sql_table_ops[normalized_table].add(op_name.lower())
+
+        definitions = symbol_data.get("definitions", [])
+        if definitions:
+            parts.append("DEFINITIONS:")
+            seen_defs: Set[Tuple[str, str]] = set()
+            added_defs = 0
+            for defn in cast(List[Dict[str, Any]], definitions):
+                type_name = (
+                    str(defn.get("type", "unknown"))
+                    .replace("_statement", "")
+                    .replace("create.", "CREATE ")
+                    .upper()
+                )
+                summary = str(defn.get("summary", "")).strip()
+                if len(summary) > 2500:
+                    summary = summary[:2500] + "..."
+
+                # Deduplicate based on type + summary
+                summary_key = (type_name, summary)
+                if summary_key not in seen_defs:
+                    seen_defs.add(summary_key)
+                    parts.append(f"  [{type_name}] {summary}")
+                    added_defs += 1
+                    if added_defs >= 3000:
+                        parts.append("  ... (truncated)")
+                        break
+
+                table_hint = cast(str, defn.get("table", "")).strip()
+                if not table_hint:
+                    m_table = re.search(
+                        r"(?i)\b(?:from|into|update|join|table|view|copy)\s+([a-zA-Z0-9_.\"]+)",
+                        summary,
+                    )
+                    if m_table:
+                        table_hint = cast(str, m_table.group(1))
+                if table_hint:
+                    _track_sql_operation(table_hint, type_name)
+
+        # SQL Inserts (New)
+        inserts = symbol_data.get("inserts", [])
+        if inserts:
+            parts.append("SQL INSERTS:")
+            # De-duplicate inserts by table and column-map
+            unique_inserts: List[Dict[str, Any]] = []
+            seen_inserts: Set[Tuple[str, str]] = set()
+            for i in cast(List[Dict[str, Any]], inserts):
+                table = str(i.get("table", "unknown"))
+                columns = json.dumps(i.get("columns", {}), sort_keys=True)
+                key = (table, columns)
+                if key not in seen_inserts:
+                    seen_inserts.add(key)
+                    unique_inserts.append(i)
+
+            for i in unique_inserts[:500]:
+                table = i.get("table", "unknown")
+                cols = i.get("columns", {})
+                cols_str = ", ".join([f"{k}={v}" for k, v in list(cols.items())])
+                parts.append(f"  INSERT INTO {table} ({cols_str})")
+                _track_sql_operation(cast(str, table), "insert")
+            if len(unique_inserts) > 500:
+                parts.append("  ... (truncated)")
+
+        columns = symbol_data.get("columns", [])
+        if columns:
+            parts.append("COLUMNS:")
+            for col in columns[:500]:
+                parts.append(f"  {col.get('name')} ({col.get('type')})")
+            if len(columns) > 500:
+                parts.append("  ... (truncated)")
+
+        relationships = symbol_data.get("relationships", [])
+        if relationships:
+            parts.append("RELATIONSHIPS:")
+            for rel in cast(List[Dict[str, Any]], relationships)[:1000]:
+                parts.append(
+                    f"  {rel.get('source_col')} -> {rel.get('target_table')}({rel.get('target_col')})"
+                )
+                _track_sql_operation(str(rel.get("target_table", "")), "fk_ref")
+            if len(cast(List[Dict[str, Any]], relationships)) > 1000:
+                parts.append("  ... (truncated)")
+
+        # SQL-specific: Tables defined and referenced (from AST analysis)
+        tables_defined = symbol_data.get("tables_defined", [])
+        if tables_defined:
+            unique_tables_defined = sorted(set(cast(List[str], tables_defined)))
+            shown_defined = unique_tables_defined
+            parts.append(f"TABLES_DEFINED: {', '.join(shown_defined)}")
+            for table_name in shown_defined:
+                _track_sql_operation(table_name, "define")
+
+        tables_referenced = symbol_data.get("tables_referenced", [])
+        if tables_referenced:
+            unique_tables_referenced = sorted(set(cast(List[str], tables_referenced)))
+            shown_referenced = unique_tables_referenced
+            parts.append(f"TABLES_REFERENCED: {', '.join(shown_referenced)}")
+            for table_name in shown_referenced:
+                _track_sql_operation(table_name, "reference")
+
+        # COPY-aware extraction for SQL dumps where parser captures mostly table refs.
+        if file_type == "sql" and content:
+            copy_stmt_pattern = re.compile(
+                r"(?im)^\s*copy\s+([^\s(]+)\s*\(([^)]*)\)\s+from\s+stdin\s*;"
+            )
+            copy_matches = list(copy_stmt_pattern.finditer(content))
+            if copy_matches:
+                parts.append("COPY_BLOCKS:")
+                for copy_match in copy_matches[:500]:
+                    table_name = copy_match.group(1).strip()
+                    raw_columns = copy_match.group(2).strip()
+                    column_names = [
+                        c.strip().strip('"')
+                        for c in raw_columns.split(",")
+                        if c.strip()
+                    ]
+
+                    tail = content[copy_match.end() :]
+                    end_match = re.search(r"(?m)^\s*\\\.\s*$", tail)
+                    data_block = tail[: end_match.start()] if end_match else tail
+                    data_rows = [ln for ln in data_block.splitlines() if ln.strip()]
+                    row_count = len(data_rows)
+                    sample_row = data_rows[0] if data_rows else ""
+                    if len(sample_row) > 1000:
+                        sample_row = sample_row[:1000] + "..."
+
+                    column_preview = ", ".join(column_names)
+
+                    parts.append(
+                        f"  {table_name} cols={len(column_names)} rows~{row_count} [{column_preview}]"
+                    )
+                    if sample_row:
+                        parts.append(f"    sample: {sample_row}")
+                    _track_sql_operation(table_name, "copy")
+
+                if len(copy_matches) > 500:
+                    parts.append("  ... (truncated)")
+
+        if file_type == "sql" and sql_table_ops:
+            parts.append("TABLE_OPERATIONS:")
+            sorted_tables = sorted(sql_table_ops.keys())
+            for table_name in sorted_tables[:500]:
+                ops = ", ".join(sorted(sql_table_ops[table_name]))
+                parts.append(f"  {table_name}: {ops}")
+            if len(sorted_tables) > 500:
+                parts.append("  ... (truncated)")
+
+        # JSON-specific structured context
+        json_keys = symbol_data.get("json_keys", [])
+        if json_keys:
+            parts.append("JSON_KEYS:")
+            seen_paths: Set[str] = set()
+            for entry in cast(List[Dict[str, Any]], json_keys):
+                path = cast(str, entry.get("path") or entry.get("key") or "").strip()
+                if path and path not in seen_paths:
+                    seen_paths.add(path)
+                    parts.append(f"  {path}")
+
+        json_refs = symbol_data.get("json_refs", [])
+        if json_refs:
+            parts.append("JSON_REFS:")
+            seen_refs: Set[str] = set()
+            for ref in cast(List[Dict[str, Any]], json_refs):
+                key_path = cast(str, ref.get("key_path", "")).strip()
+                value = cast(str, ref.get("value", "")).strip()
+                if not value:
+                    continue
+                line = f"{key_path} -> {value}" if key_path else value
+                if line not in seen_refs:
+                    seen_refs.add(line)
+                    parts.append(f"  {line}")
+
+    if is_doc:
+        headers = symbol_data.get("headers", [])
+        code_blocks = symbol_data.get("code_blocks", [])
+        doc_link_count = (
+            len(cast(List[Dict[str, Any]], links)) if isinstance(links, list) else 0
+        )
+        doc_image_count = (
+            len(cast(List[Dict[str, Any]], images)) if isinstance(images, list) else 0
+        )
+
+        parts.append(
+            f"DOC_PROFILE: headers={len(cast(List[Any], headers))}, "
+            f"code_blocks={len(cast(List[Any], code_blocks))}, "
+            f"links={doc_link_count}, images={doc_image_count}"
+        )
+
+        if headers:
+            parts.append("HEADERS:")
+            seen_headers: Set[str] = set()
+            for h in cast(List[Dict[str, Any]], headers)[:500]:
+                raw_level = h.get("level", 1)
+                level = raw_level if isinstance(raw_level, int) else 1
+                indent = "  " * max(0, min(level - 1, 5))
+                text = cast(str, h.get("text", "")).strip()
+                if not text:
+                    continue
+                header_line = f"{indent}- {text}"
+                if header_line not in seen_headers:
+                    seen_headers.add(header_line)
+                    parts.append(header_line)
+            if len(cast(List[Dict[str, Any]], headers)) > 500:
+                parts.append("  ... (truncated)")
+
+        if code_blocks:
+            lang_counts: Dict[str, int] = {}
+            for cb in cast(List[Dict[str, Any]], code_blocks):
+                lang = str(cb.get("language", "text")).strip().lower() or "text"
+                lang_counts[lang] = lang_counts.get(lang, 0) + 1
+            if lang_counts:
+                lang_summary = ", ".join(
+                    f"{lang}:{count}"
+                    for lang, count in sorted(
+                        lang_counts.items(), key=lambda kv: (-kv[1], kv[0])
+                    )[:30]
+                )
+                parts.append(f"CODE_LANGS: {lang_summary}")
+
+            parts.append("CODE_SIGNATURES:")
+            seen_signatures: Set[str] = set()
+            for cb in cast(List[Dict[str, Any]], code_blocks):
+                lang = str(cb.get("language", "text")).strip().lower() or "text"
+                cb_content = str(cb.get("content", "")).strip()
+                if not cb_content:
+                    continue
+
+                candidate_lines = [
+                    ln.strip() for ln in cb_content.splitlines() if ln.strip()
+                ]
+                signature_line = ""
+                for line in candidate_lines:
+                    lowered = line.lower()
+                    if line.startswith(
+                        (
+                            "def ",
+                            "class ",
+                            "CREATE ",
+                            "INSERT ",
+                            "UPDATE ",
+                            "SELECT ",
+                            "DELETE ",
+                            "COPY ",
+                        )
+                    ) or lowered.startswith(
+                        (
+                            "def ",
+                            "class ",
+                            "create ",
+                            "insert ",
+                            "update ",
+                            "select ",
+                            "delete ",
+                            "copy ",
+                            "function ",
+                            "const ",
+                            "let ",
+                            "var ",
+                        )
+                    ):
+                        signature_line = line
+                        break
+                if not signature_line:
+                    signature_line = candidate_lines[0]
+                if len(signature_line) > 500:
+                    signature_line = signature_line[:500] + "..."
+
+                block_summary = f"  [{lang}] {signature_line}"
+                if block_summary not in seen_signatures:
+                    seen_signatures.add(block_summary)
+                    parts.append(block_summary)
+                if len(seen_signatures) >= 500:
+                    parts.append("  ... (truncated)")
+                    break
+
+        # Essence extraction for docs > 8k (handled at top)
+        essence = (
+            preprocess_doc_structure(content, transparency_metadata) if content else ""
+        )
+        if essence:
+            parts.append(f"ESSENCE:\n{essence}")
+
+    # 5. Generic Fallback (Crucial for unanalyzed file types or symbols-sparse files)
+    current_ses_len = len("\n".join(parts))
+    # For documentation files, we usually want the content preview even if we have some metadata,
+    # as long as we haven't already included the full content or reached a large size.
+    if content and current_ses_len < 5000:
+        parts.append("CONTENT_PREVIEW:")
+        snippet = content[:3500].strip()
+        parts.append(
+            textwrap.indent(snippet + ("..." if len(content) > 3500 else ""), "  ")
+        )
 
     # Join and truncate if needed
     result = "\n".join(parts)
@@ -811,30 +1924,267 @@ def generate_symbol_essence_string(
     return result
 
 
-def preprocess_doc_structure(content: str) -> str:
+def parse_structured_doc(
+    content: str, transparency_metadata: Optional[Dict[str, Any]] = None
+) -> str:
     """
-    Preprocesses documentation for embedding/reranking.
-    Returns the full content (truncated to 32k chars) to preserve context.
+    Parses a structured documentation file (using ---SECTION_START---/---SECTION_END--- markers
+    or a transparency metadata layer) and extracts the essence for SES generation.
+
+    Extraction rules:
+    - TAGS: Full inclusion (tags + related_tags)
+    - CONTEXT: Full inclusion (1-2 dense sentences)
+    - OVERVIEW: Headers only
+    - DETAILS: Sub-headers only (code blocks handled separately via symbol_data)
+    - REFERENCES: Full inclusion (links to related files)
     """
-    # Return full content with a generous safety cap
-    return content[:32000]
+    parts: List[str] = []
+
+    # Extract TAGS section (full)
+    tags_match = _extract_section(content, "TAGS", transparency_metadata)
+    if tags_match:
+        for line in tags_match.strip().split("\n"):
+            line = line.strip()
+            if line and not line.startswith("<!--"):
+                parts.append(f"TAG: {line}")
+
+    # Extract CONTEXT section (full)
+    context_match = _extract_section(content, "CONTEXT", transparency_metadata)
+    if context_match:
+        for line in context_match.strip().split("\n"):
+            line = line.strip()
+            if line and not line.startswith("##"):
+                parts.append(line)
+
+    # Extract OVERVIEW section (headers and first bit of content)
+    overview_match = _extract_section(content, "OVERVIEW", transparency_metadata)
+    if overview_match:
+        o_lines = [l.strip() for l in overview_match.strip().split("\n") if l.strip()]
+        for i, line in enumerate(o_lines):
+            if line.startswith("#"):
+                parts.append(line)
+                # Capture next non-header line if available
+                if i + 1 < len(o_lines) and not o_lines[i + 1].startswith("#"):
+                    snippet = o_lines[i + 1]
+                    parts.append(f"  {snippet}")
+
+    # Extract DETAILS section (sub-headers and first bit)
+    details_match = _extract_section(content, "DETAILS", transparency_metadata)
+    if details_match:
+        d_lines = [l.strip() for l in details_match.strip().split("\n") if l.strip()]
+        for i, line in enumerate(d_lines):
+            if line.startswith("#"):
+                parts.append(line)
+                if i + 1 < len(d_lines) and not d_lines[i + 1].startswith("#"):
+                    snippet = d_lines[i + 1]
+                    parts.append(f"  {snippet}")
+
+    # Extract REFERENCES section (full)
+    refs_match = _extract_section(content, "REFERENCES", transparency_metadata)
+    if refs_match:
+        for line in refs_match.strip().split("\n"):
+            line = line.strip()
+            if line and not line.startswith("##"):
+                parts.append(line)
+
+    return "\n".join(parts)
+
+
+def _extract_section(
+    content: str,
+    section_name: str,
+    transparency_metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """
+    Extracts the content between ---SECTION_NAME_START--- and ---SECTION_NAME_END--- markers.
+    If transparency_metadata is provided, it uses the mapped line numbers.
+    Returns None if markers are not found.
+    """
+    # 1. Try Transparency Metadata first
+    if transparency_metadata:
+        sections = cast(Dict[str, Any], transparency_metadata.get("sections", {}))
+        if section_name in sections:
+            mapping = sections[section_name]
+
+            # A. Check for virtual content (e.g., TAGS that were removed from file)
+            if isinstance(mapping, dict) and "content" in mapping:
+                return cast(str, mapping["content"])
+
+            # B. Check for line range mapping
+            if (
+                isinstance(mapping, (list, tuple))
+                and len(cast(Sequence[Any], mapping)) == 2
+            ):
+                mapping_seq = cast(Sequence[Any], mapping)
+                start_line: int = int(mapping_seq[0])
+                end_line: int = int(mapping_seq[1])
+                lines = content.splitlines()
+                if 1 <= start_line <= len(lines) and 1 <= end_line <= len(lines):
+                    # Line numbers in registry are 1-indexed
+                    return "\n".join(lines[start_line - 1 : end_line])
+
+    # 2. Fallback to physical markers
+    start_marker = f"---{section_name}_START---"
+    end_marker = f"---{section_name}_END---"
+
+    start_idx = content.find(start_marker)
+    if start_idx == -1:
+        return None
+
+    start_idx += len(start_marker)
+    end_idx = content.find(end_marker, start_idx)
+    if end_idx == -1:
+        return None
+
+    return content[start_idx:end_idx]
+
+
+def preprocess_doc_structure(
+    content: str, transparency_metadata: Optional[Dict[str, Any]] = None
+) -> str:
+    """
+    Preprocesses documentation for embedding/reranking to extract its essence.
+
+    If the document follows the structured template (has ---TAGS_START--- marker
+    or a transparency metadata layer), uses parse_structured_doc for precise extraction.
+    Otherwise, falls back to header + first-paragraph extraction.
+    """
+    # Check for structured doc markers or transparency metadata
+    if "---TAGS_START---" in content or (
+        transparency_metadata and transparency_metadata.get("sections")
+    ):
+        return parse_structured_doc(content, transparency_metadata)
+
+    # Fallback: extract headers/snippets and transcript-style turns
+    lines = [l.strip() for l in content.split("\n") if l.strip()]
+    if not lines:
+        return ""
+
+    transcript_markers = 0
+    for line in lines[:1000]:
+        lower = line.lower()
+        if (
+            '"user"' in lower
+            or '"model"' in lower
+            or '"assistant"' in lower
+            or '# "user"' in lower
+            or '# "model"' in lower
+        ):
+            transcript_markers += 1
+
+    # Transcript-like docs: preserve speaker-turn snippets for semantic retrieval.
+    if transcript_markers >= 6:
+        turns: List[str] = []
+        for i, line in enumerate(lines):
+            lower = line.lower()
+            role = ""
+            if '"user"' in lower or '# "user"' in lower:
+                role = "USER"
+            elif '"model"' in lower or '"assistant"' in lower or '# "model"' in lower:
+                role = "MODEL"
+            if not role:
+                continue
+
+            snippet = ""
+            for j in range(i + 1, min(i + 8, len(lines))):
+                candidate = lines[j].strip().strip(",")
+                candidate = candidate.strip("'\"")
+                if (
+                    not candidate
+                    or candidate.startswith("#")
+                    or candidate.startswith("```")
+                    or candidate.lower().startswith(("http", "file://"))
+                ):
+                    continue
+                snippet = candidate
+                break
+
+            if snippet:
+                if len(snippet) > 500:
+                    snippet = snippet[:500] + "..."
+                turns.append(f"{role}: {snippet}")
+            if len(turns) >= 140:
+                break
+
+        if turns:
+            return "\n".join(turns)
+
+    essence_parts: List[str] = []
+    last_header_index = -1
+    seen_lines: Set[str] = set()
+
+    for i, line in enumerate(lines):
+        if line.startswith("#"):
+            header = line[:500]
+            if header not in seen_lines:
+                seen_lines.add(header)
+                essence_parts.append(header)
+            last_header_index = i
+            continue
+
+        # Keep short snippet lines after each header.
+        if last_header_index != -1 and i in (
+            last_header_index + 1,
+            last_header_index + 2,
+            last_header_index + 3,
+        ):
+            if not any(line.startswith(c) for c in ["http", "file://"]):
+                snippet = line
+                if len(snippet) > 500:
+                    snippet = snippet[:500] + "..."
+                candidate = f"  {snippet}"
+                if candidate not in seen_lines:
+                    seen_lines.add(candidate)
+                    essence_parts.append(candidate)
+            continue
+
+        # Capture informative bullets in long freeform docs.
+        if line.startswith(("- ", "* ")):
+            bullet = line[:500]
+            if bullet not in seen_lines:
+                seen_lines.add(bullet)
+                essence_parts.append(bullet)
+
+        # If no headers, keep a few lead paragraphs.
+        if last_header_index == -1 and len(essence_parts) < 12:
+            if not any(
+                line.startswith(c) for c in ["> ", "http", "file://", "```", "|"]
+            ):
+                para = line[:500]
+                if para not in seen_lines:
+                    seen_lines.add(para)
+                    essence_parts.append(para)
+
+        if len(essence_parts) >= 180:
+            break
+
+    return "\n".join(essence_parts)
 
 
 # --- Reranker Logic ---
 
-RERANKER_MODEL: Optional[Any] = None
-RERANKER_TOKENIZER: Optional[Any] = None
+_reranker_model: Optional[Any] = None
+_reranker_tokenizer: Optional[Any] = None
 
 # Pre-computed tokenizer values to avoid concurrency issues
-RERANKER_FALSE_ID: Optional[int] = None
-RERANKER_TRUE_ID: Optional[int] = None
-RERANKER_PREFIX_TOKENS: Optional[List[int]] = None
-RERANKER_SUFFIX_TOKENS: Optional[List[int]] = None
+reranker_false_id: Optional[int] = None
+reranker_true_id: Optional[int] = None
+_reranker_prefix_tokens: Optional[List[int]] = None
+_reranker_suffix_tokens: Optional[List[int]] = None
 
 # Reranking tracking variables
-RERANKED_FILES: set = set()
-RERANKING_COUNTER: int = 0
-TOTAL_FILES_TO_RERANK: int = 0
+reranked_files: Set[str] = set()
+reranking_counter: int = 0
+total_files_to_rerank: int = 0
+
+# Reranker scheduling — serializes the VRAM read → batch plan → allocate
+# critical section so concurrent threads don't all plan against the same
+# stale VRAM snapshot. Forward passes still run concurrently.
+_RERANKER_PLAN_LOCK = threading.Lock()
+MIN_RERANK_BATCH_SIZE = 6  # Don't thrash with items=1; wait for VRAM instead
+RERANK_MAX_PROMPT_TOKENS = 16384
+RERANK_WAIT_TIMEOUT_SEC = 20.0
+RERANK_ALLOC_TIMEOUT_SEC = 120.0
 
 # Qwen3 Reranker Configuration
 RERANKER_REPO_ID = "ManiKumarAdapala/Qwen3-Reranker-0.6B-Q8_0-Safetensors"
@@ -849,38 +2199,12 @@ RERANKER_FILES = [
 
 def _download_file(url: str, path: str, description: str) -> bool:
     """Generic file download with progress reporting."""
-    try:
-        logger.info(f"Downloading {description} from {url} to {path}")
-        with urllib.request.urlopen(url) as response:
-            total_size = int(response.headers.get("Content-Length", 0))
-            downloaded = 0
-            chunk_size = 8192
-
-            with open(path, "wb") as f:
-                while True:
-                    chunk = response.read(chunk_size)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    downloaded += len(chunk)
-
-                    if total_size > 0:
-                        progress = (downloaded / total_size) * 100
-                        print(
-                            f"\rDownload progress ({description}): {progress:.1f}% ({downloaded}/{total_size} bytes)",
-                            end="",
-                            flush=True,
-                        )
-            print()  # Newline after progress bar
-        return True
-    except Exception as e:
-        logger.error(f"Failed to download {description}: {e}")
-        if os.path.exists(path):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-        return False
+    return _download_with_retry(
+        url=url,
+        path=path,
+        description=description,
+        use_phase_tracker=False,
+    )
 
 
 def _verify_reranker_model(model_dir: str) -> bool:
@@ -924,16 +2248,59 @@ def _download_reranker_model(model_dir: str) -> bool:
         return False
 
 
+def _flush_accelerator_memory_cache() -> None:
+    """Flush GPU/MPS allocator caches after releasing model tensors."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
+
+
+def _release_reranker_model_allocation(model: Any = None) -> None:
+    """Drop a partial reranker model allocation without clearing the tokenizer."""
+    global _reranker_model
+
+    release = model if model is not None else _reranker_model
+    _reranker_model = None
+    if release is not None:
+        del release
+    gc.collect()
+    _flush_accelerator_memory_cache()
+
+
+def _clear_reranker_load_state() -> None:
+    """Clear reranker singletons and free VRAM after a failed load."""
+    global _reranker_model, _reranker_tokenizer
+    global reranker_false_id, reranker_true_id, _reranker_prefix_tokens, _reranker_suffix_tokens
+
+    stale_model = _reranker_model
+    stale_tokenizer = _reranker_tokenizer
+    _reranker_model = None
+    _reranker_tokenizer = None
+    reranker_false_id = None
+    reranker_true_id = None
+    _reranker_prefix_tokens = None
+    _reranker_suffix_tokens = None
+
+    del stale_model, stale_tokenizer
+    gc.collect()
+    _flush_accelerator_memory_cache()
+
+
 def _load_reranker_model():
     """Lazy loads the reranker model (Singleton)."""
-    global RERANKER_MODEL, RERANKER_TOKENIZER
-    global RERANKER_FALSE_ID, RERANKER_TRUE_ID, RERANKER_PREFIX_TOKENS, RERANKER_SUFFIX_TOKENS
+    global _reranker_model, _reranker_tokenizer
+    global reranker_false_id, reranker_true_id, _reranker_prefix_tokens, _reranker_suffix_tokens
 
     with MODEL_LOCK:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        if RERANKER_MODEL is not None:
-            return RERANKER_TOKENIZER, RERANKER_MODEL
+        if _reranker_model is not None:
+            return _reranker_tokenizer, _reranker_model
 
         try:
             # Use local model path if available, otherwise download
@@ -955,58 +2322,61 @@ def _load_reranker_model():
 
             device = _select_device()
 
-            RERANKER_TOKENIZER = AutoTokenizer.from_pretrained(
-                model_name_or_path,
-                trust_remote_code=True,
-                padding_side="left",  # Left padding for generation/classification to align last token
+            _reranker_tokenizer = cast(
+                Any,
+                AutoTokenizer.from_pretrained(  # type: ignore
+                    model_name_or_path,
+                    padding_side="left",  # Left padding for generation/classification to align last token
+                ),
             )
+            assert _reranker_tokenizer is not None
 
             # Pre-compute special tokens and IDs under lock to avoid concurrency issues
-            RERANKER_FALSE_ID = RERANKER_TOKENIZER.convert_tokens_to_ids("no")
-            RERANKER_TRUE_ID = RERANKER_TOKENIZER.convert_tokens_to_ids("yes")
+            reranker_false_id = _reranker_tokenizer.convert_tokens_to_ids("no")
+            reranker_true_id = _reranker_tokenizer.convert_tokens_to_ids("yes")
 
-            if RERANKER_FALSE_ID is None or RERANKER_TRUE_ID is None:
+            if reranker_false_id is None or reranker_true_id is None:
                 logger.error(
-                    f"Could not find 'yes' (id={RERANKER_TRUE_ID}) or 'no' (id={RERANKER_FALSE_ID}) tokens in tokenizer. Model may be corrupted."
+                    f"Could not find 'yes' (id={reranker_true_id}) or 'no' (id={reranker_false_id}) tokens in tokenizer. Model may be corrupted."
                 )
                 raise RuntimeError("Invalid tokenizer state for reranker")
 
             prefix = '<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>\n<|im_start|>user\n'
             suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
-            RERANKER_PREFIX_TOKENS = RERANKER_TOKENIZER.encode(
+            _reranker_prefix_tokens = _reranker_tokenizer.encode(
                 prefix, add_special_tokens=False
             )
-            RERANKER_SUFFIX_TOKENS = RERANKER_TOKENIZER.encode(
+            _reranker_suffix_tokens = _reranker_tokenizer.encode(
                 suffix, add_special_tokens=False
             )
 
             # Optimizations: Flash Attention 2 and float16 for CUDA
             try:
                 if device == "cuda":
-                    RERANKER_MODEL = AutoModelForCausalLM.from_pretrained(
-                        model_name_or_path,  # FIXED: was model_name
+                    _reranker_model = AutoModelForCausalLM.from_pretrained(  # type: ignore
+                        model_name_or_path,
                         dtype=torch.float16,  # Use 'dtype' instead of 'torch_dtype'
                         attn_implementation="flash_attention_2",
-                        trust_remote_code=True,
                     )
                 else:
-                    RERANKER_MODEL = AutoModelForCausalLM.from_pretrained(
-                        model_name_or_path, trust_remote_code=True
+                    _reranker_model = AutoModelForCausalLM.from_pretrained(  # type: ignore
+                        model_name_or_path
                     )
             except Exception as e:
                 logger.warning(
                     f"Optimization failed, falling back to standard load: {e}"
                 )
-                RERANKER_MODEL = AutoModelForCausalLM.from_pretrained(
-                    model_name_or_path, trust_remote_code=True
+                _release_reranker_model_allocation(_reranker_model)
+                _reranker_model = AutoModelForCausalLM.from_pretrained(  # type: ignore
+                    model_name_or_path
                 )
 
                 # Only move non-quantized models manually
-                if not getattr(RERANKER_MODEL, "is_quantized", False):
-                    RERANKER_MODEL.to(device)
+                if not getattr(_reranker_model, "is_quantized", False):
+                    _reranker_model.to(device)
 
-            RERANKER_MODEL.eval()
+            _reranker_model.eval()
 
             # Create a dummy tensor to prime the CUDA context with the expected dtype and device
             if device == "cuda":
@@ -1016,8 +2386,10 @@ def _load_reranker_model():
                 logger.debug("CUDA context primed with dummy tensor.")
 
             # Verify Flash Attention
-            if hasattr(RERANKER_MODEL.config, "_attn_implementation"):
-                attn_impl = RERANKER_MODEL.config._attn_implementation
+            if hasattr(_reranker_model.config, "_attn_implementation"):
+                attn_impl = getattr(
+                    _reranker_model.config, "_attn_implementation", "unknown"
+                )
                 if attn_impl == "flash_attention_2":
                     logger.info("Flash Attention 2 is active!")
                 else:
@@ -1030,32 +2402,22 @@ def _load_reranker_model():
                 torch.cuda.synchronize()
                 model_memory_gb = torch.cuda.memory_allocated() / (1024**3)
                 logger.info(
-                    f"Loaded Qwen3-Reranker (Q8 quantized) on {RERANKER_MODEL.device}. "
+                    f"Loaded Qwen3-Reranker (Q8 quantized) on {_reranker_model.device}. "
                     f"Model footprint: {model_memory_gb:.2f}GB"
                 )
             else:
-                logger.info(f"Loaded Qwen3-Reranker-0.6B on {RERANKER_MODEL.device}")
+                logger.info(f"Loaded Qwen3-Reranker-0.6B on {_reranker_model.device}")
         except Exception as e:
             logger.error(f"Failed to load reranker: {e}", exc_info=True)
-            # Clean up partial load
-            RERANKER_MODEL = None
-            RERANKER_TOKENIZER = None
-            RERANKER_FALSE_ID = None
-            RERANKER_TRUE_ID = None
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            _clear_reranker_load_state()
             return None, None
 
-    return RERANKER_TOKENIZER, RERANKER_MODEL
+    return _reranker_tokenizer, _reranker_model
 
 
 def unload_reranker_model():
     """Unloads reranker model to free memory."""
-    global RERANKER_MODEL, RERANKER_TOKENIZER
-    RERANKER_MODEL = None
-    RERANKER_TOKENIZER = None
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    _clear_reranker_load_state()
 
 
 def get_instruction_for_relation_type(source_path: str, target_path: str) -> str:
@@ -1074,13 +2436,13 @@ def get_instruction_for_relation_type(source_path: str, target_path: str) -> str
     target_cat = map_to_category(target_ext_type)
 
     if source_cat == "code" and target_cat == "code":
-        return "Retrieve the code file that is structurally or semantically related to the query code file, sharing dependencies or functionality."
+        return "Retrieve the code file that is structurally or semantically related to the query code file, sharing dependencies or functionality. Will file A be affected by changes in file B, or vice versa?"
     elif (source_cat == "doc" and target_cat == "code") or (
         source_cat == "code" and target_cat == "doc"
     ):
-        return "Retrieve the file that explains or implements the concepts described in the query."
+        return "Retrieve the file that explains, provides relevant context, or implements the concepts described in the query."
     elif source_cat == "doc" and target_cat == "doc":
-        return "Retrieve the documentation file that is thematically related to the query documentation file."
+        return "Retrieve the documentation file that explains, informs, or supports the query documentation file."
     else:
         return "Retrieve the structural dependency match based on symbol definitions and references"
 
@@ -1101,33 +2463,31 @@ def _calculate_dynamic_batch_size(
     - Context=32000: ~2.5GB per sample -> Batch size ~2
     """
     # Empirical formula: MB per sample = base_overhead + (context_length * kb_per_token)
-    # These values are tuned from actual VRAM observations
-    base_overhead_mb = 175  # Base overhead per sample in MB
-    mb_per_1k_tokens = 80  # Additional MB per 1000 tokens
+    # Set base_overhead_mb to 30MB to cover per-item fixed metadata/overhead + safety.
+    # Set mb_per_1k_tokens to 120MB to cover KV cache + activations + padding overhead + safety.
+    base_overhead_mb = 30  # Base overhead per sample in MB
+    mb_per_1k_tokens = 120  # MB per 1000 tokens
 
     estimated_mb_per_sample = (
         base_overhead_mb + (context_length / 1000.0) * mb_per_1k_tokens
     )
     estimated_gb_per_sample = estimated_mb_per_sample / 1024.0
 
-    # Safety buffer: leave 20% or 1GB, whichever is larger
-    reserved_buffer = max(1.0, available_mem_gb * 0.2)
+    # Safety buffer: leave 10% or 0.5GB, whichever is larger
+    # Reduced constant buffer from 1.0GB to 0.5GB as reliability improves
+    reserved_buffer = max(0.5, available_mem_gb * 0.1)
     usable_mem_gb = max(0.0, available_mem_gb - reserved_buffer)
-
-    # if usable_mem_gb <= 0.1:
-    # logger.warning("Very low memory available for batch processing.")
-    # return 1
 
     max_batch = int(usable_mem_gb / estimated_gb_per_sample)
 
     # Clamp batch size
-    max_batch = max(1, min(max_batch, 50))  # Cap at 50 to avoid other bottlenecks
+    max_batch = max(1, min(max_batch, 50))  # Cap at 50
 
-    logger.debug(
-        f"Dynamic Batch Sizing: Available={available_mem_gb:.2f}GB, "
-        f"Context={context_length}, Est.PerSample={estimated_gb_per_sample:.2f}GB "
-        f"-> Batch Size={max_batch}"
-    )
+    # logger.debug(
+    #     f"Dynamic Batch Sizing: Available={available_mem_gb:.2f}GB, "
+    #     f"Context={context_length}, Est.PerSample={estimated_gb_per_sample:.2f}GB "
+    #     f"-> Batch Size={max_batch}"
+    # )
     return max_batch
 
 
@@ -1139,13 +2499,19 @@ def _get_rerank_cache_key(
     instruction: Optional[str] = None,
 ) -> str:
     """Generates a deterministic cache key for reranking."""
-    # Hash the candidate texts to create a compact key part
-    import hashlib
-
     candidates_hash = hashlib.md5(
         "".join(sorted(candidate_texts)).encode("utf-8")
     ).hexdigest()
-    return f"rerank:{hashlib.md5(query_text.encode('utf-8')).hexdigest()}:{candidates_hash}:{top_k}"
+    query_hash = hashlib.md5(query_text.encode("utf-8")).hexdigest()
+    instruction_hash = hashlib.sha256((instruction or "").encode("utf-8")).hexdigest()[
+        :16
+    ]
+    source_normalized = normalize_path(source_file_path) if source_file_path else ""
+    source_hash = hashlib.sha256(source_normalized.encode("utf-8")).hexdigest()[:16]
+    return (
+        f"rerank:{query_hash}:{candidates_hash}:{top_k}:"
+        f"{instruction_hash}:{source_hash}"
+    )
 
 
 @cached("reranking", key_func=_get_rerank_cache_key)
@@ -1172,8 +2538,8 @@ def rerank_candidates_with_qwen3(
         return [(i, 1.0) for i in range(len(candidate_texts))][:top_k]
 
     # Use pre-computed values
-    token_false_id = RERANKER_FALSE_ID
-    token_true_id = RERANKER_TRUE_ID
+    token_false_id = reranker_false_id
+    token_true_id = reranker_true_id
 
     if token_false_id is None or token_true_id is None:
         logger.error("Pre-computed token IDs are missing.")
@@ -1191,20 +2557,21 @@ def rerank_candidates_with_qwen3(
 
     # 1. Prepare and Tokenize All Candidates
     # We tokenize everything upfront to get accurate lengths for sorting and batching.
-    full_prompts_data = []
+    query_text = query_text[:12000]
+    full_prompts_data: List[Dict[str, Any]] = []
     for i, doc in enumerate(candidate_texts):
-        prompt = f"{prefix}<Instruct>: {instruction}\n<Query>: {query_text}\n<Document>: {doc}{suffix}"
+        doc_limited = doc[:12000]
+        prompt = f"{prefix}<Instruct>: {instruction}\n<Query>: {query_text}\n<Document>: {doc_limited}{suffix}"
         full_prompts_data.append({"index": i, "text": prompt})
 
     try:
         # Tokenize without padding first to get raw lengths
-        # We use a large max_length here to avoid premature truncation, but clamp to model max if needed.
-        # Qwen3 typically handles 32k, but let's use a reasonable upper bound.
+        # Cap prompt length to keep VRAM usage predictable under concurrent reranking.
         all_inputs = tokenizer(
             [p["text"] for p in full_prompts_data],
             padding=False,
             truncation=True,
-            max_length=32000,  # Hard cap to prevent insane memory usage
+            max_length=RERANK_MAX_PROMPT_TOKENS,
             add_special_tokens=False,  # We added them manually in the prompt string
         )
 
@@ -1220,45 +2587,135 @@ def rerank_candidates_with_qwen3(
     # This groups short items together (large batches) and long items together (small batches).
     sorted_items = sorted(full_prompts_data, key=lambda x: x["length"])
 
-    all_scores = []
+    all_scores: List[Tuple[int, float]] = []
     start_idx = 0
     total_candidates = len(sorted_items)
 
-    # 3. Process in Dynamic Batches
-    while start_idx < total_candidates:
-        # CRITICAL: Re-poll available memory before each batch calculation
-        # This ensures we get accurate, real-time values after previous batches free memory
-        if device == "cuda":
-            available_mem = _get_available_vram()
-        else:
-            available_mem = _get_available_ram()
-
-        # Peek at the next item to establish a baseline length
-        # (In a sorted list, this is the shortest in the remaining set)
-        current_item = sorted_items[start_idx]
-        current_len = current_item["length"]
-
-        # Calculate initial batch size based on this length
-        # This gives us a "maximum possible batch size" if all subsequent items were this short.
-        batch_size = _calculate_dynamic_batch_size(available_mem, current_len, device)
-
-        # Look ahead to find the actual max length in this tentative batch
-        end_idx = min(start_idx + batch_size, total_candidates)
-        last_item_in_batch = sorted_items[end_idx - 1]
-        max_len_in_batch = last_item_in_batch["length"]
-
-        # Recalculate batch size based on the ACTUAL longest item in the batch
-        real_batch_size = _calculate_dynamic_batch_size(
-            available_mem, max_len_in_batch, device
+    # 3. Process in Dynamic Batches with VRAM coordination
+    # Get the VRAM manager directly for coordinated VRAM management
+    vram_manager = None
+    if device == "cuda":
+        from cline_utils.dependency_system.utils.resource_validator import (
+            get_vram_manager,
         )
 
-        # If the real batch size is smaller than our lookahead, we need to shrink
-        if real_batch_size < (end_idx - start_idx):
-            end_idx = min(start_idx + real_batch_size, total_candidates)
-            # Update max length for the new, smaller batch
-            max_len_in_batch = sorted_items[end_idx - 1]["length"]
+        vram_manager = get_vram_manager()
+
+    while start_idx < total_candidates:
+        # Check for backpressure from the VRAM manager
+        if vram_manager is not None and vram_manager.should_pause_for_backpressure():
+            logger.debug("Reranking paused due to VRAM backpressure")
+            vram_manager.wait_for_available_vram(0.75, timeout=RERANK_WAIT_TIMEOUT_SEC)
+
+        # ── Serialized batch planning ────────────────────────────────
+        # Acquire the planning lock so that only one thread at a time
+        # reads VRAM, calculates batch size, and submits an allocation
+        # request.  This prevents N threads from all planning against
+        # the same stale GB reading simultaneously.  The lock is
+        # held only during planning (~0.1 ms), NOT during the forward
+        # pass, so compute still runs concurrently.
+        _wait_for_vram_gb: float = 0.0
+        with _RERANKER_PLAN_LOCK:
+            # Re-poll available memory with fresh hardware reading
+            if device == "cuda" and vram_manager is not None:
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                available_mem = vram_manager.get_available_for_allocation()
+            else:
+                available_mem = _get_available_ram()
+
+            # Peek at the next item to establish a baseline length
+            current_item = sorted_items[start_idx]
+            current_len = current_item["length"]
+
+            # Calculate initial batch size based on shortest remaining item
+            batch_size = _calculate_dynamic_batch_size(
+                available_mem, current_len, device
+            )
+
+            # Look ahead to find the actual max length in this tentative batch
+            end_idx = min(start_idx + batch_size, total_candidates)
+            last_item_in_batch = sorted_items[end_idx - 1]
+            max_len_in_batch = last_item_in_batch["length"]
+
+            # Recalculate batch size based on the ACTUAL longest item
+            real_batch_size = _calculate_dynamic_batch_size(
+                available_mem, max_len_in_batch, device
+            )
+
+            # If the real batch size is smaller than our lookahead, shrink
+            if real_batch_size < (end_idx - start_idx):
+                end_idx = min(start_idx + real_batch_size, total_candidates)
+                max_len_in_batch = sorted_items[end_idx - 1]["length"]
+
+            actual_batch_count = end_idx - start_idx
+            remaining_items = total_candidates - start_idx
+
+            # ── Minimum batch enforcement ────────────────────────────
+            # If batch is too small AND there are enough items remaining,
+            # wait for VRAM instead of thrashing with items=1 batches.
+            if (
+                actual_batch_count < MIN_RERANK_BATCH_SIZE
+                and remaining_items >= MIN_RERANK_BATCH_SIZE
+                and vram_manager is not None
+            ):
+                min_batch_end = min(start_idx + MIN_RERANK_BATCH_SIZE, total_candidates)
+                min_batch_max_len: int = int(sorted_items[min_batch_end - 1]["length"])
+                _wait_for_vram_gb = (
+                    float(
+                        MIN_RERANK_BATCH_SIZE
+                        * (175 + (min_batch_max_len / 1000.0) * 80)
+                    )
+                    / 1024.0
+                )
+                # logger.debug(
+                #     f"Batch too small ({actual_batch_count} < {MIN_RERANK_BATCH_SIZE}), "
+                #     f"waiting for {_wait_for_vram_gb:.2f}GB VRAM"
+                # )
+            # Lock released here by 'with' block exit
+
+        # After releasing the lock, wait for VRAM if needed and retry
+        if _wait_for_vram_gb > 0.0 and vram_manager is not None:
+            became_available = vram_manager.wait_for_available_vram(
+                _wait_for_vram_gb, timeout=RERANK_WAIT_TIMEOUT_SEC
+            )
+            if became_available:
+                continue  # Re-enter loop: re-acquire lock, re-poll VRAM
+            logger.debug(
+                f"Timed out waiting for {_wait_for_vram_gb:.2f}GB VRAM; "
+                f"continuing with smaller rerank batch."
+            )
 
         batch_items = sorted_items[start_idx:end_idx]
+
+        # Estimate VRAM needed for this batch and request allocation
+        # Use the same verified model as _calculate_dynamic_batch_size:
+        # base_overhead=30MB/sample + 120MB per 1k tokens per sample
+        estimated_mb = len(batch_items) * (30 + (max_len_in_batch / 1000.0) * 120)
+        estimated_vram_gb = estimated_mb / 1024.0
+
+        logger.debug(
+            f"Batch plan: items={len(batch_items)}, max_tokens={max_len_in_batch}, "
+            f"est_vram={estimated_vram_gb:.2f}GB, available={available_mem:.2f}GB"
+        )
+        allocation_id = None
+
+        if vram_manager is not None and device == "cuda":
+            # Request VRAM allocation through the VRAM manager (blocking)
+            granted, allocation_id = vram_manager.request_allocation(
+                size_gb=max(estimated_vram_gb, 0.75),  # Minimum 0.75GB per batch
+                blocking=True,
+                timeout=RERANK_ALLOC_TIMEOUT_SEC,
+            )
+            if not granted:
+                logger.warning(
+                    f"VRAM allocation denied/timed out for batch after "
+                    f"{RERANK_ALLOC_TIMEOUT_SEC:.0f}s, using fallback scores"
+                )
+                for item in batch_items:
+                    all_scores.append((item["index"], 0.0))
+                start_idx = end_idx
+                continue
 
         try:
             # Clear cache before allocation to reduce fragmentation
@@ -1282,8 +2739,8 @@ def rerank_candidates_with_qwen3(
                 )
 
                 # Move to device
-                for key in padded_batch:
-                    padded_batch[key] = padded_batch[key].to(device)
+                for k in padded_batch:
+                    padded_batch[k] = padded_batch[k].to(device)
 
                 # Get logits
                 logits = model(**padded_batch).logits[:, -1, :]
@@ -1297,7 +2754,9 @@ def rerank_candidates_with_qwen3(
                 batch_scores_tensor = torch.nn.functional.log_softmax(
                     batch_scores_tensor, dim=1
                 )
-                scores = batch_scores_tensor[:, 1].exp().tolist()
+                tensor_slice = batch_scores_tensor[:, 1].exp()
+                # Use Any cast to silence tolist() unknown return type error
+                scores = cast(List[float], cast(Any, tensor_slice).tolist())
 
                 # Collect scores with original indices
                 for item, score in zip(batch_items, scores):
@@ -1317,6 +2776,10 @@ def rerank_candidates_with_qwen3(
             # Fallback: assign zero scores
             for item in batch_items:
                 all_scores.append((item["index"], 0.0))
+        finally:
+            # Always release the VRAM allocation
+            if allocation_id is not None and vram_manager is not None:
+                vram_manager.release_allocation(allocation_id)
 
         # Move to next batch
         start_idx = end_idx
@@ -1325,6 +2788,36 @@ def rerank_candidates_with_qwen3(
     # all_scores contains (original_index, score)
     all_scores.sort(key=lambda x: x[1], reverse=True)
     return all_scores[:top_k]
+
+
+def _get_text_content_for_embedding(
+    file_path: str, symbol_map: Dict[str, Any], project_root: str
+) -> str:
+    """Helper to retrieve text content for embedding from symbol map or file."""
+    ext = os.path.splitext(file_path)[1].lower()
+    is_doc = ext in [".md", ".txt", ".rst"]
+
+    if file_path in symbol_map:
+        # For docs in symbol map, we still want the essence string if it's been updated to handle them
+        return generate_symbol_essence_string(
+            file_path, symbol_map[file_path], symbol_map=symbol_map
+        )
+
+    try:
+        content = read_file_content_safely(file_path)
+        if content is None:
+            raise Exception("Failed to read file")
+
+        if is_doc:
+            return preprocess_doc_structure(content)
+
+        rel_path = os.path.relpath(file_path, project_root)
+        # Strip transient [AUTO] comments before raw embedding
+        stable_content = strip_auto_generated_blocks(content, file_path)
+        return f"[FILE: {rel_path}]\n{stable_content[:32000]}"
+    except Exception as e:
+        logger.error(f"Failed to read {file_path}: {e}")
+        return ""
 
 
 # --- Main Embedding Generation ---
@@ -1358,6 +2851,41 @@ def generate_embeddings(
     if symbol_map is None:
         symbol_map = _load_project_symbol_map()
 
+    # Load existing metadata to preserve tokens for skipped files
+    metadata_path = os.path.join(embeddings_dir, "metadata.json")
+    existing_metadata = {}
+    existing_metadata_by_path: Dict[str, Dict[str, Any]] = {}
+    metadata_version = ""
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                metadata_version = str(data.get("version", ""))
+                existing_metadata = cast(Dict[str, Any], data.get("keys", {}))
+                for m_v in existing_metadata.values():
+                    m_value = cast(Dict[str, Any], m_v)
+                    path_value = m_value.get("path")
+                    if not isinstance(path_value, str) or not path_value:
+                        continue
+                    try:
+                        existing_metadata_by_path[normalize_path(path_value)] = m_value
+                    except Exception:
+                        continue
+                if metadata_version != EMBEDDING_METADATA_VERSION:
+                    logger.info(
+                        f"Embedding metadata version mismatch "
+                        f"(found='{metadata_version}', expected='{EMBEDDING_METADATA_VERSION}'). "
+                        "Forcing embedding regeneration to refresh SES token counts."
+                    )
+                    existing_metadata = {}
+                    existing_metadata_by_path = {}
+                    force = True
+        except Exception as e:
+            logger.warning(f"Failed to load existing metadata: {e}")
+
+    # Track token counts for all files
+    final_token_counts: Dict[str, Dict[str, int]] = {}
+
     # 2. Identification Phase
     files_to_process: List[KeyInfo] = []
 
@@ -1382,25 +2910,96 @@ def generate_embeddings(
                 src_mtime = os.path.getmtime(key_info.norm_path)
                 emb_mtime = os.path.getmtime(embedding_path)
                 if src_mtime > emb_mtime:
-                    should_process = True
+                    # mtime changed, but maybe it's just [AUTO] comments.
+                    # Perform "Deep Check" using stored content_hash.
+                    m_item = cast(
+                        Optional[Dict[str, Any]],
+                        (
+                            existing_metadata.get(key_info.key_string)
+                            or existing_metadata_by_path.get(key_info.norm_path)
+                        ),
+                    )
+                    stored_hash = (
+                        str(m_item.get("content_hash"))
+                        if m_item and m_item.get("content_hash")
+                        else None
+                    )
+
+                    if stored_hash:
+                        raw_content = read_file_content_safely(key_info.norm_path)
+                        if raw_content:
+                            current_hash = calculate_content_hash(
+                                raw_content, key_info.norm_path
+                            )
+
+                            if current_hash == stored_hash:
+                                # Content is same! Touch .npy to align mtime and skip.
+                                logger.debug(
+                                    f"Skipping {os.path.basename(key_info.norm_path)} due to hash match."
+                                )
+                                os.utime(embedding_path, None)
+                                should_process = False
+                            else:
+                                should_process = True
+                        else:
+                            should_process = True
+                    else:
+                        should_process = True
             except OSError:
                 should_process = True
 
         if should_process:
             files_to_process.append(key_info)
 
-    if not files_to_process:
-        logger.info("All embeddings are up to date.")
+    if not files_to_process and all(
+        (
+            (
+                key_info.key_string in existing_metadata
+                and (
+                    "tokens" in existing_metadata[key_info.key_string]
+                    or (
+                        "ses_tokens" in existing_metadata[key_info.key_string]
+                        and "full_tokens" in existing_metadata[key_info.key_string]
+                    )
+                )
+            )
+            or (
+                key_info.norm_path in existing_metadata_by_path
+                and (
+                    "tokens" in existing_metadata_by_path[key_info.norm_path]
+                    or (
+                        "ses_tokens" in existing_metadata_by_path[key_info.norm_path]
+                        and "full_tokens"
+                        in existing_metadata_by_path[key_info.norm_path]
+                    )
+                )
+            )
+        )
+        for key_info in path_to_key_info.values()
+        if not key_info.is_directory
+    ):
+        logger.info("All embeddings and metadata are up to date.")
         return True
 
     logger.info(
         f"Generating embeddings for {len(files_to_process)} files using Symbol Essence..."
     )
 
-    # 3. Processing Phase
-    logger.info(
-        f"Generating embeddings for {len(files_to_process)} files using Symbol Essence..."
-    )
+    # 2.5. Transparency Pre-alignment / Pre-recovery Phase
+    # Perform all drift checks and realignment/recovery in a single context block
+    # to avoid sequential lock acquisition and repeated atomic disk writes.
+    try:
+        from cline_utils.dependency_system.io.transparency_manager import get_transparency_manager
+        tm_manager = get_transparency_manager()
+        logger.info("Performing pre-alignment and drift checks on transparency registry in batch...")
+        with tm_manager._update_context():
+            for key_info in files_to_process:
+                # Trigger read_file_transparently which does check_drift and auto-recovery inside our single context!
+                # Since we are inside _update_context, any recovery or invalidation will modify self._registry in-memory
+                # and only write to disk ONCE at the end.
+                read_file_transparently(key_info.norm_path)
+    except Exception as e:
+        logger.error(f"Failed during transparency pre-alignment phase: {e}", exc_info=True)
 
     # 3. Processing Phase
     # Pre-calculate token counts and sort to optimize model loading
@@ -1408,66 +3007,87 @@ def generate_embeddings(
     if tokenizer is None:
         logger.warning("Tokenizer not found. Using character-based token estimation.")
 
-    processing_queue = []
+    processing_queue: List[Dict[str, Any]] = []
+
+    # Parallelize the file reading, SES generation, and token counting.
+    import concurrent.futures
+
+    def process_file_prep(key_info_obj: KeyInfo) -> Optional[Dict[str, Any]]:
+        try:
+            fp = key_info_obj.norm_path
+            rp = os.path.relpath(fp, project_root)
+            
+            text_to_embed = _get_text_content_for_embedding(
+                fp, symbol_map, project_root
+            )
+
+            if not text_to_embed.strip():
+                return None
+
+            # Count tokens
+            ses_tc = _count_tokens(text_to_embed, tokenizer)
+
+            # Count Full Context tokens (for raw file content)
+            full_tc = 0
+            full_content = read_file_content_safely(fp)
+            if full_content:
+                full_tc = _count_tokens(full_content, tokenizer)
+
+            return {
+                "key_info": key_info_obj,
+                "text": text_to_embed,
+                "tokens": ses_tc,
+                "rel_path": rp,
+                "ses_token_count": ses_tc,
+                "full_token_count": full_tc
+            }
+        except Exception as ex:
+            logger.error(f"Error preparing embedding for {key_info_obj.norm_path}: {ex}")
+            return None
 
     with PhaseTracker(
         total=len(files_to_process), phase_name="Preparing Embeddings"
     ) as prep_tracker:
-        for key_info in files_to_process:
-            file_path = key_info.norm_path
-            rel_path = os.path.relpath(file_path, project_root)
-            prep_tracker.set_description(f"Reading {os.path.basename(rel_path)}")
-            text_to_embed = ""
+        num_workers = min(16, os.cpu_count() or 4)
+        logger.info(f"Preparing embeddings concurrently using {num_workers} threads...")
 
-            # Strategy: Symbol Map -> Doc Structure -> Raw Fallback
-            if file_path in symbol_map:
-                text_to_embed = generate_symbol_essence_string(
-                    file_path, symbol_map[file_path], symbol_map=symbol_map
-                )
-            else:
-                # Not in symbol map (e.g. documentation, config files, or analysis skipped)
-                try:
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        content = f.read()
-
-                    ext = os.path.splitext(file_path)[1].lower()
-                    if ext in [".md", ".txt", ".rst"]:
-                        text_to_embed = preprocess_doc_structure(content)
-                    else:
-                        # Raw fallback for unknown types
-                        text_to_embed = (
-                            f"[FILE: {rel_path}]\n{content[:32000]}"  # Increased limit
-                        )
-                except Exception as e:
-                    logger.error(f"Failed to read {file_path}: {e}")
-                    prep_tracker.update()
-                    continue
-
-            if not text_to_embed.strip():
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+            # Submit all tasks
+            future_to_file = {
+                executor.submit(process_file_prep, ki): ki for ki in files_to_process
+            }
+            
+            # Gather results as they complete
+            for future in concurrent.futures.as_completed(future_to_file):
+                ki = future_to_file[future]
+                rp_path = os.path.relpath(ki.norm_path, project_root)
+                prep_tracker.set_description(f"Loaded {os.path.basename(rp_path)}")
+                
+                result = future.result()
+                if result:
+                    # Update token counts dictionary
+                    final_token_counts[result["key_info"].key_string] = {
+                        "ses_tokens": result["ses_token_count"],
+                        "full_tokens": result["full_token_count"],
+                    }
+                    processing_queue.append({
+                        "key_info": result["key_info"],
+                        "text": result["text"],
+                        "tokens": result["tokens"],
+                        "rel_path": result["rel_path"],
+                    })
                 prep_tracker.update()
-                continue
-
-            # Count tokens
-            token_count = _count_tokens(text_to_embed, tokenizer)
-
-            processing_queue.append(
-                {
-                    "key_info": key_info,
-                    "text": text_to_embed,
-                    "tokens": token_count,
-                    "rel_path": rel_path,
-                }
-            )
-            prep_tracker.update()
 
     # Sort by token count (ascending) to grow context window monotonically
-    processing_queue.sort(key=lambda x: x["tokens"])
-
-    current_batch_texts = []
-    current_batch_paths = []
+    # Sort by tokens to optimize model window
+    processing_queue.sort(key=lambda x: cast(int, x["tokens"]))
+    current_batch_texts: List[str] = []
+    current_batch_paths: List[str] = []
 
     # Determine batch size
-    effective_batch_size = batch_size or (64 if SELECTED_DEVICE == "cuda" else 16)
+    effective_batch_size = batch_size or (
+        64 if _selected_device_cache == "cuda" else 16
+    )
 
     with PhaseTracker(
         total=len(processing_queue), phase_name="Generating Embeddings"
@@ -1476,9 +3096,9 @@ def generate_embeddings(
             tracker.set_description(f"Embedding {os.path.basename(item['rel_path'])}")
 
             # Calculate required n_ctx for this item
-            # Formula: max(actual_tokens + 512, 8192)
+            # Formula: max(actual_tokens + 512, 12800)
             # Cap at MAX_CONTEXT_LENGTH
-            required_n_ctx = min(max(item["tokens"] + 512, 8192), MAX_CONTEXT_LENGTH)
+            required_n_ctx = min(max(item["tokens"] + 512, 12800), MAX_CONTEXT_LENGTH)
 
             # Ensure model is loaded with sufficient context
             try:
@@ -1504,26 +3124,103 @@ def generate_embeddings(
             _flush_batch(current_batch_texts, current_batch_paths)
             tracker.update(len(current_batch_texts))
 
-    # Create/Update Metadata
+    # 4. Create/Update Metadata
     metadata_path = os.path.join(embeddings_dir, "metadata.json")
-    new_metadata = {
-        "version": "2.0_SES",
-        "model": SELECTED_MODEL_CONFIG["name"] if SELECTED_MODEL_CONFIG else "unknown",
+    new_metadata: Dict[str, Any] = {
+        "version": EMBEDDING_METADATA_VERSION,
+        "model": (
+            _selected_model_config["name"] if _selected_model_config else "unknown"
+        ),
         "keys": {},
     }
 
-    # Populate metadata with current state of all valid files
+    # If we have existing metadata, carry it over by stable file path.
+    # This prevents token drift when key instance suffixes (#n) are reassigned.
+    if existing_metadata:
+        existing_items = cast(Dict[str, Dict[str, Any]], existing_metadata)
+        for v in existing_items.values():
+            m_path = v.get("path")
+            if not isinstance(m_path, str) or not m_path:
+                continue
+
+            norm_m_path = normalize_path(m_path)
+            current_ki = path_to_key_info.get(norm_m_path)
+            if not current_ki or current_ki.is_directory:
+                continue
+
+            migrated_item: Dict[str, Any] = dict(v)
+            # Migrate old tokens if needed
+            if "tokens" in migrated_item and (
+                "full_tokens" not in migrated_item or "ses_tokens" not in migrated_item
+            ):
+                migrated_item["ses_tokens"] = migrated_item["tokens"]
+                # Safe fallback for legacy metadata without full token counts
+                migrated_item["full_tokens"] = migrated_item["tokens"]
+                del migrated_item["tokens"]
+
+            migrated_item["path"] = current_ki.norm_path
+            new_metadata["keys"][current_ki.key_string] = migrated_item
+
+    # Overwrite with new items or add new ones
     for key_info in path_to_key_info.values():
         if key_info.is_directory:
             continue
+
         rel_path = os.path.relpath(key_info.norm_path, project_root)
         npy_path = os.path.join(embeddings_dir, rel_path) + ".npy"
 
         if os.path.exists(npy_path):
             try:
+                # Get token count: new > existing > calculate
+                token_data = final_token_counts.get(key_info.key_string)
+
+                ses_tokens = 0
+                full_tokens = 0
+
+                if token_data is not None:
+                    ses_tokens = token_data["ses_tokens"]
+                    full_tokens = token_data["full_tokens"]
+                elif (
+                    existing_metadata_by_path
+                    and key_info.norm_path in existing_metadata_by_path
+                ):
+                    m_item = existing_metadata_by_path[key_info.norm_path]
+                    if "ses_tokens" in m_item:
+                        ses_tokens = cast(int, m_item["ses_tokens"])
+                        full_tokens = cast(int, m_item.get("full_tokens", ses_tokens))
+                    elif "tokens" in m_item:
+                        ses_tokens = cast(int, m_item["tokens"])
+                        full_tokens = ses_tokens
+                else:
+                    # Fallback: calculate now
+                    try:
+                        text = _get_text_content_for_embedding(
+                            key_info.norm_path, symbol_map, project_root
+                        )
+                        ses_tokens = _count_tokens(text, tokenizer)
+                        # Try to get full too
+                        full_content = read_file_content_safely(key_info.norm_path)
+                        if full_content is not None:
+                            full_tokens = _count_tokens(full_content, tokenizer)
+                        else:
+                            full_tokens = ses_tokens
+                    except Exception:
+                        full_tokens = ses_tokens
+
+                # Calculate stable hash for the metadata
+                content_hash = ""
+                raw_for_hash = read_file_content_safely(key_info.norm_path)
+                if raw_for_hash:
+                    content_hash = calculate_content_hash(
+                        raw_for_hash, key_info.norm_path
+                    )
+
                 new_metadata["keys"][key_info.key_string] = {
                     "path": key_info.norm_path,
                     "mtime": os.path.getmtime(key_info.norm_path),
+                    "content_hash": content_hash,
+                    "ses_tokens": ses_tokens,
+                    "full_tokens": full_tokens,
                 }
             except OSError:
                 pass
@@ -1554,19 +3251,19 @@ def _flush_batch(texts: List[str], save_paths: List[str]):
         return
 
     try:
-        if MODEL_INSTANCE is None:
+        if _model_instance is None:
             logger.error("Model instance lost during batch flush")
             return
 
-        if SELECTED_MODEL_CONFIG and SELECTED_MODEL_CONFIG["type"] == "gguf":
+        if _selected_model_config and _selected_model_config["type"] == "gguf":
             # GGUF (llama-cpp) handles one by one in loop usually unless batched explicitly
-            embeddings = []
+            embeddings: List[np.ndarray] = []
             for t in texts:
-                res = MODEL_INSTANCE.embed(t)
+                res = _model_instance.embed(t)
                 embeddings.append(np.array(res, dtype=np.float32))
         else:
             # SentenceTransformer handles batches natively
-            embeddings = MODEL_INSTANCE.encode(
+            embeddings = _model_instance.encode(
                 texts, show_progress_bar=False, convert_to_numpy=True
             )
 
@@ -1588,15 +3285,61 @@ def _flush_batch(texts: List[str], save_paths: List[str]):
 # --- Similarity Calculation ---
 
 
-def _get_similarity_cache_key(key1: str, key2: str, *args, **kwargs) -> str:
+def _get_similarity_cache_key(key1: str, key2: str, *args: Any, **kwargs: Any) -> str:
     """Generates a deterministic cache key for similarity."""
     # deterministic order
     k1, k2 = sorted((key1, key2))
     return f"sim_ses:{k1}:{k2}"
 
 
+def _get_similarity_file_deps(
+    key1_str: str,
+    key2_str: str,
+    embeddings_dir: str,
+    path_to_key_info: Dict[str, KeyInfo],
+    project_root: str,
+    *args: Any,
+    **kwargs: Any,
+) -> List[str]:
+    """
+    Returns the .npy file paths for the two keys.
+    Used by @cached decorator to track file dependencies and mtimes.
+    """
+    file_paths: List[str] = []
+
+    # Ensure embeddings_dir is an absolute path
+    if embeddings_dir and not os.path.isabs(embeddings_dir):
+        embeddings_dir = os.path.join(project_root, embeddings_dir)
+
+    for key_str in [key1_str, key2_str]:
+        npy_path: Optional[str] = None
+
+        # Try to resolve via path_to_key_info first
+        ki = next(
+            (k for k in path_to_key_info.values() if k.key_string == key_str), None
+        )
+        if ki:
+            rel = os.path.relpath(ki.norm_path, project_root)
+            npy_path = os.path.join(embeddings_dir, rel) + ".npy"
+        else:
+            # Fallback: Try direct key-to-filename mapping (for testing/simple cases)
+            # e.g., key "1A1" -> "embeddings_dir/1A1.npy"
+            direct_npy = os.path.join(embeddings_dir, f"{key_str}.npy")
+            if os.path.exists(direct_npy):
+                npy_path = direct_npy
+
+        if npy_path and os.path.exists(npy_path):
+            file_paths.append(npy_path)
+
+    return file_paths
+
+
 @cached(
-    "similarity_calculation", key_func=_get_similarity_cache_key, ttl=SIM_CACHE_TTL_SEC
+    "similarity_calculation",
+    key_func=_get_similarity_cache_key,
+    ttl=SIM_CACHE_TTL_SEC,
+    file_deps=_get_similarity_file_deps,
+    check_mtime=True,
 )
 def calculate_similarity(
     key1_str: str,
@@ -1650,9 +3393,17 @@ def calculate_similarity(
 # --- File Validation Helper ---
 
 
+def _get_is_valid_cache_key(fp: str) -> str:
+    """Generates cache key for file validation."""
+    config_path = ConfigManager().config_path
+    mtime = os.path.getmtime(config_path) if os.path.exists(config_path) else 0
+    return f"is_valid:{normalize_path(fp)}:{mtime}"
+
+
 @cached(
     "file_validation",
-    key_func=lambda file_path: f"is_valid_file:{normalize_path(file_path)}",
+    key_func=_get_is_valid_cache_key,
+    track_path_args=[0],
 )
 def _is_valid_file(file_path: str) -> bool:
     """Check if a file is valid for processing (not excluded, size limit)."""
@@ -1685,19 +3436,3 @@ def _is_valid_file(file_path: str) -> bool:
         return True
     except Exception:
         return False
-
-
-# --- CLI Placeholders ---
-def register_parser(subparsers):
-    parser = subparsers.add_parser("generate-embeddings", help="Generate embeddings")
-    parser.add_argument("project_paths", nargs="+")
-    parser.add_argument("--force", action="store_true")
-    parser.set_defaults(func=command_handler)
-
-
-def command_handler(args):
-    logger.error("Direct CLI usage deprecated. Use project_analyzer.")
-    return 1
-
-
-# EoF

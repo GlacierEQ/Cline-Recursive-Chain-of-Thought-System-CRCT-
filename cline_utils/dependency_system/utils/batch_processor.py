@@ -12,10 +12,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
-# Removed cache import as caching batch processing itself is complex and often not desired
-# from cline_utils.dependency_system.utils.cache_manager import cached
-
 from cline_utils.dependency_system.utils.phase_tracker import PhaseTracker
+
+# VRAM-aware imports (lazy)
+# import torch -> moved to usage sites
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,7 @@ class BatchProcessor:
         batch_size: Optional[int] = None,
         show_progress: bool = True,
         phase_name: str = "Processing",
+        respect_vram_limits: bool = False,
     ):
         """
         Initialize the batch processor.
@@ -41,10 +42,40 @@ class BatchProcessor:
             batch_size: Size of batches to process (defaults to adaptive sizing)
             show_progress: Whether to show progress information (prints to stdout)
             phase_name: Name of the phase for the progress tracker
+            respect_vram_limits: If True, limit workers based on available VRAM (default: False)
+                Should only be set to True for GPU-intensive tasks like reranking.
         """
+        super().__init__()
         cpu_count = os.cpu_count() or 8
-        # Increase parallelism: use 4x CPUs by default, cap at 48 to avoid runaway threads
-        default_workers = min(4, (cpu_count * 4))
+        # Increase parallelism: use 4x CPUs by default, cap at 25 to avoid runaway threads
+        default_workers = min(25, (cpu_count * 4))
+
+        # VRAM-aware worker limiting - ONLY apply if explicitly requested
+        if respect_vram_limits:
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    from cline_utils.dependency_system.utils.resource_validator import (
+                        get_vram_manager,
+                    )
+
+                    vram_manager = get_vram_manager()
+                    vram_recommended = vram_manager.get_recommended_max_workers()
+                    original_default = default_workers
+                    default_workers = min(default_workers, vram_recommended)
+                    if default_workers < original_default:
+                        logger.info(
+                            f"VRAM-aware worker limit applied: {default_workers} workers "
+                            f"(CPU limit: {original_default}, VRAM limit: {vram_recommended})"
+                        )
+            except ImportError:
+                logger.debug(
+                    "Torch not installed, skipping VRAM-aware worker limiting."
+                )
+            except Exception as e:
+                logger.warning(f"Could not apply VRAM-aware worker limits: {e}")
+
         # Ensure max_workers is at least 1
         self.max_workers = max(1, max_workers or default_workers)
         self.batch_size = batch_size
@@ -53,6 +84,7 @@ class BatchProcessor:
         self.total_items = 0
         self.processed_items = 0
         self.start_time = 0.0
+        self.tracker = None  # Initialize tracker attribute
 
     # <<< MODIFIED: Accept **kwargs >>>
     def process_items(
@@ -92,13 +124,19 @@ class BatchProcessor:
 
         # Use PhaseTracker if progress is enabled
         self.tracker = None
-        context_manager = PhaseTracker(total=self.total_items, phase_name=self.phase_name) if self.show_progress else None
-        
+        context_manager = (
+            PhaseTracker(total=self.total_items, phase_name=self.phase_name)
+            if self.show_progress
+            else None
+        )
+
         if context_manager:
             with context_manager as tracker:
                 self.tracker = tracker
                 for i in range(0, self.total_items, actual_batch_size):
-                    batch_indices = range(i, min(i + actual_batch_size, self.total_items))
+                    batch_indices = range(
+                        i, min(i + actual_batch_size, self.total_items)
+                    )
                     batch_items = [items[idx] for idx in batch_indices]
 
                     if not batch_items:
@@ -123,8 +161,8 @@ class BatchProcessor:
                     self.processed_items = items_processed_in_batches
                     tracker.update(len(batch_items))
         else:
-             # No progress bar logic
-             for i in range(0, self.total_items, actual_batch_size):
+            # No progress bar logic
+            for i in range(0, self.total_items, actual_batch_size):
                 batch_indices = range(i, min(i + actual_batch_size, self.total_items))
                 batch_items = [items[idx] for idx in batch_indices]
 
@@ -143,15 +181,14 @@ class BatchProcessor:
                         logger.error(
                             f"Calculated invalid global index {global_index} from batch index {original_idx} (batch start {i})"
                         )
-                
+
                 items_processed_in_batches += len(batch_items)
                 self.processed_items = items_processed_in_batches
 
         final_time = time.time() - self.start_time
         logger.debug(f"Processed {self.total_items} items in {final_time:.2f} seconds")
-        
-        # Filter out potential None values if errors occurred and weren't replaced
-        # Or raise an error if None is found, depending on desired strictness
+
+        # Count non-None results to identify processing failures while preserving None placeholders for index alignment
         final_results = [res for res in results if res is not None]
         if len(results) != self.total_items:
             logger.critical(
@@ -160,7 +197,7 @@ class BatchProcessor:
 
         if any(res is None for res in results):
             logger.warning(
-                f"Some items failed processing ({len(results) - len(final_results)} errors). Results list contains only successful items."
+                f"Some items failed processing ({len(results) - len(final_results)} errors). Results list contains None placeholders for failed items at corresponding indices to preserve 1-to-1 index correlation."
             )
 
         # Make sure final newline is printed after progress bar
@@ -175,7 +212,7 @@ class BatchProcessor:
         self,
         items: List[T],
         processor_func: Callable[..., R],
-        collector_func: Callable[[List[R]], Any],
+        collector_func: Callable[[List[Optional[R]]], Any],
         **kwargs: Any,
     ) -> Any:
         """
@@ -339,12 +376,14 @@ def process_items(
     show_progress: bool = True,
     phase_name: str = "Processing",
     **kwargs: Any,
-) -> List[R]:
+) -> List[Optional[R]]:
     """
     Convenience function to process items in parallel using BatchProcessor.
     Extra keyword arguments (**kwargs) are passed directly to the processor_func.
     """
-    processor = BatchProcessor(max_workers, batch_size, show_progress, phase_name=phase_name)
+    processor = BatchProcessor(
+        max_workers, batch_size, show_progress, phase_name=phase_name
+    )
     return processor.process_items(items, processor_func, **kwargs)
 
 
@@ -352,7 +391,7 @@ def process_items(
 def process_with_collector(
     items: List[T],
     processor_func: Callable[..., R],
-    collector_func: Callable[[List[R]], Any],
+    collector_func: Callable[[List[Optional[R]]], Any],
     max_workers: Optional[int] = None,
     batch_size: Optional[int] = None,
     show_progress: bool = True,

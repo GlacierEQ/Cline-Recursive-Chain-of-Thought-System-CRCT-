@@ -1,11 +1,11 @@
 # Hardware Optimization Guide
 
 > [!TIP]
-> CRCT v8.0 automatically adapts to your hardware. This guide explains how the system selects models, optimizes performance, and how to fine-tune for your environment.
+> CRCT v8.4 automatically adapts to your hardware. This guide explains how the system selects models, optimizes performance, and how to fine-tune for your environment.
 
 ## Overview
 
-Version 8.0 introduces **hardware-adaptive** behavior that automatically:
+Version 8.4 introduces **hardware-adaptive** behavior that automatically:
 - Detects available VRAM, RAM, and CPU resources
 - Selects optimal embedding and reranking models
 - Adjusts batch sizes for maximum throughput
@@ -254,37 +254,38 @@ max_workers = min(cpu_count * 4, 64)
 
 ## Memory Management
 
-### Peak Memory Usage
+### Cache Compression & Memory Budgeting (v8.3)
 
-During analysis, memory usage peaks during:
+Version 8.3 introduces a **Global Memory Budget** that automatically scales based on your system RAM:
+- **Low RAM (<4GB)**: 128MB budget.
+- **Mid RAM (4-16GB)**: 512MB budget.
+- **High RAM (>16GB)**: 2048MB budget.
 
-1. **Embedding Generation**: Batch size × model size
-2. **Reranker Loading**: ~2GB (Qwen3 model in VRAM)
-3. **Symbol Map Generation**: ~5MB per 1000 files
+The system also proactively compresses large items:
+- Items >10MB compressed with gzip.
+- **Typical Savings**: 30-50% for large projects.
 
-### Automatic Unloading
+### Multi-threaded Prefetching (v8.3)
+To eliminate I/O bottlenecks, the system now uses parallel workers to prefetch dependency data:
+- **Default**: `min(32, cpu_count * 2)` workers.
+- **Impact**: Up to 40% reduction in total analysis time on systems with fast NVMe storage.
+ 
+ ### Deterministic VRAM Scaling (v8.4)
+ Version 8.4 refactors the `resolve-placeholders` loop to process tasks sorted by descending context size. This ensures:
+ - **Monotonic VRAM Usage**: Starts with the most demanding task and moves to smaller ones.
+ - **Prevented Reloads**: Minimizes the frequency of GGUF model context reloads.
+ - **Efficiency**: Maximizes throughput for long-running batch operations.
+ 
+ ### Bolt Optimization Performance (v8.4)
+ The **Bolt Optimization** transitions directory dependency resolution to an $O(M)$ model using global set sharing. On large projects, this reduces directory-walk I/O overhead by up to **90%**, as each tracker no longer reconstructs its parent path independently.
 
-The system automatically unloads reranker after suggestions:
+---
 
-```python
-# After dependency suggestion phase
-unload_reranker_model()
-torch.cuda.empty_cache()  # Free VRAM
-```
+## Model Resource Accuracy (v8.3)
 
-### Cache Compression
-
-Cache manager compresses large items:
-
-```python
-# Items >1KB compressed with gzip
-if size > 1024:
-    compressed = gzip.compress(pickle.dumps(value))
-    if len(compressed) < len(original) * 0.9:  # 10% savings
-        store_compressed(compressed)
-```
-
-**Typical Savings**: 30-50% for large projects
+We have corrected the VRAM footprint estimates for the Qwen3 reranker to prevent OOM errors:
+- **Qwen3-Reranker-0.6B**: 0.7 GB (Corrected from 0.07 GB).
+- **Qwen3-Embedding-4B**: 2.4 GB.
 
 ---
 
@@ -570,4 +571,4 @@ Planned optimizations:
 
 ---
 
-**Hardware optimization in v8.0 is automatic and intelligent.** The system adapts to your resources, ensuring the best possible performance without manual tuning. For most users, the defaults are optimal.
+**Hardware optimization in v8.4 is automatic and intelligent.** The system adapts to your resources, ensuring the best possible performance without manual tuning. For most users, the defaults are optimal.
